@@ -181,8 +181,8 @@ module.exports = async (req, res) => {
             const u = await redis.get("user:" + telegramId);
             if (u && u.pwdHash && bcrypt.compareSync(password, u.pwdHash)) {
               await clearFailedLogins(lockKey);
-              const token = sign({ sub: String(telegramId), role: "client", company: u.company, phone });
-              return res.status(200).json({ ok: true, token, role: "client", name: u.company });
+              const token = sign({ sub: String(telegramId), role: "client", company: u.company, phone, tenantId: u.tenantId || null });              
+               return res.status(200).json({ ok: true, token, role: "client", name: u.company });
             }
           }
 
@@ -199,8 +199,8 @@ module.exports = async (req, res) => {
                 return res.status(403).json({ ok: false, error: "account blocked" });
               }
               await clearFailedLogins(lockKey);
-              const token = sign({ sub: emp.id, role: emp.role || "accountant", name: emp.name });
-              return res.status(200).json({ ok: true, token, role: emp.role || "accountant", name: emp.name });
+              const token = sign({ sub: emp.id, role: emp.role || "accountant", name: emp.name, tenantId: emp.tenantId || null });
+               return res.status(200).json({ ok: true, token, role: emp.role || "accountant", name: emp.name });
             }
           }
         }
@@ -212,8 +212,8 @@ module.exports = async (req, res) => {
             return res.status(403).json({ ok: false, error: "account blocked" });
           }
           await clearFailedLogins(lockKey);
-          const token = sign({ sub: emp.id, role: emp.role || "accountant", name: emp.name });
-          return res.status(200).json({ ok: true, token, role: emp.role || "accountant", name: emp.name });
+          const token = sign({ sub: emp.id, role: emp.role || "accountant", name: emp.name, tenantId: emp.tenantId || null });          
+           return res.status(200).json({ ok: true, token, role: emp.role || "accountant", name: emp.name });
         }
 
         await registerFailedLogin(lockKey);
