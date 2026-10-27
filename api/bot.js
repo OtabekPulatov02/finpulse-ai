@@ -107,9 +107,6 @@ async function askAiInGroup(ctx, query, msg, priorHistory) {
       await ctx.reply(`⚠️ Не удалось получить ответ от ИИ: ${escapeHtml((r && r.error) || "неизвестная ошибка")}`, { parse_mode: "HTML", reply_to_message_id: msg.message_id }).catch(() => {});
       return;
     }
-    const stepsLine = r.steps && r.steps.length
-      ? `<i>🔧 ${r.steps.map((s) => escapeHtml(s.tool)).join(", ")}</i>\n\n`
-      : "";
     const body = mdToTelegramHtml(r.reply || "(пустой ответ)");
     /* Если ИИ вызвал ask_user (например выбор шаблона документа/подтверждение
        smart-подсказки) — показываем варианты кнопками, а не просто текстом,
@@ -124,7 +121,7 @@ async function askAiInGroup(ctx, query, msg, priorHistory) {
       try { await redis.set("aiopt:" + token, { history: newHistory, options }, { ex: 24 * 3600 }); } catch (e) { /* noop */ }
       replyMarkup = { inline_keyboard: options.map((opt, i) => [{ text: String(opt).slice(0, 64), callback_data: `aio:${token}:${i}` }]) };
     }
-    const sent = await sendLong(ctx, `🤖 <b>ИИ-бухгалтер</b> (${escapeHtml(byName)}):\n${stepsLine}${body}`, {
+    const sent = await sendLong(ctx, `🤖 <b>ИИ-бухгалтер</b> (${escapeHtml(byName)}):\n${body}\n\n<i>↩️ Ответьте на это сообщение, чтобы продолжить</i>`, {
       parse_mode: "HTML", reply_to_message_id: msg.message_id, ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
     /* Сохраняем историю диалога под id только что отправленного сообщения —
@@ -989,6 +986,7 @@ async function requireOnboardedUser(ctx) {
 }
 
 bot.command("start", async (ctx) => {
+  if (isGroup(ctx)) return ctx.reply(groupHelp(), { parse_mode: "HTML" });
   if (!isPrivate(ctx)) return;
   const u = await getUser(ctx.from.id);
   if (u && u.lang && u.company) {
@@ -1007,6 +1005,7 @@ bot.command("lang", async (ctx) => {
 });
 
 bot.command("help", async (ctx) => {
+  if (isGroup(ctx)) return ctx.reply(groupHelp(), { parse_mode: "HTML" });
   if (!isPrivate(ctx)) return;
   const u = await getUser(ctx.from.id);
   const text = T[u?.lang || "ru"].help + crmAccessBlock(u);
@@ -1060,6 +1059,23 @@ bot.on("message:migrate_to_chat_id", async (ctx) => {
 });
 
 /* ---------------- Команды: группа ---------------- */
+/* Шпаргалка для бухгалтеров в группе — показывается на /help, /start и
+   после /bind. Без технических терминов: только «что сделать, чтобы…». */
+function groupHelp() {
+  /* «Бот, …» работает, только если у бота выключен privacy mode (BotFather →
+     /setprivacy → Disable): иначе Telegram не присылает боту обычные
+     сообщения группы. Поэтому подсказываем тот способ, который реально
+     сработает сейчас. */
+  const me = bot.botInfo || {};
+  const askHow = me.can_read_all_group_messages
+    ? "начните сообщение со слова «Бот,» например:\n<i>Бот, какое сальдо у ООО Ромашка?</i>"
+    : `упомяните бота в сообщении, например:\n<i>@${escapeHtml(me.username || "бот")} какое сальдо у ООО Ромашка?</i>`;
+  return "<b>Как пользоваться ботом в группе</b>\n\n" +
+    "💬 <b>Ответить клиенту</b> — нажмите «Ответить» на карточку задачи и напишите текст или прикрепите файл. Бот поставит 👍, когда клиент получит ответ.\n\n" +
+    "🤖 <b>Спросить ИИ-бухгалтера</b> — " + askHow + "\n\n" +
+    "↩️ <b>Продолжить разговор с ИИ</b> — нажмите «Ответить» на его сообщение.\n\n" +
+    "👉 Исполнитель и статус задачи меняются в CRM.";
+}
 bot.command("bind", async (ctx) => {
   if (!isGroup(ctx)) return;
   const code = (ctx.match || "").trim();
@@ -1068,7 +1084,7 @@ bot.command("bind", async (ctx) => {
   }
   await redis.set("group", ctx.chat.id);
   return ctx.reply(
-    "✅ Группа привязана к Finpulse CRM!\n\nСюда будут приходить новые задачи клиентов. Отвечайте на карточку задачи — ответ уйдёт клиенту."
+    "✅ Группа привязана к Finpulse CRM!\n\n" + groupHelp(), { parse_mode: "HTML" }
   );
 });
 
@@ -1331,7 +1347,8 @@ async function createTaskFromDraft(ctx, u, deferred) {
     const tail =
       (task.files.length ? `\n\n📎 Вложений: ${task.files.length}` : "") +
       (deferred ? `\n⏸ <i>Получена вне часов приёма — в работу с ${set.workStart}:00</i>` : "") +
-      `\n\n👉 <i>Исполнитель и статус — в CRM</i>`;
+      `\n\n↩️ <i>Ответьте на это сообщение — ответ уйдёт клиенту</i>` +
+      `\n👉 <i>Исполнитель и статус — в CRM</i>`;
     const room = 3700 - base.length - tail.length;
     let body = escapeHtml(task.text);
     let rest = "";
@@ -1710,8 +1727,14 @@ bot.on("message", async (ctx) => {
       const isBareAskCmd = /^\/ask(?:@\w+)?\s*$/i.test(rawText);
       const askCmdMatch = /^\/ask(?:@\w+)?\s+([\s\S]+)/i.exec(rawText);
       let askQuery = null;
+      /* Для тех, кто не знает про команды и @упоминания: сообщение,
+         начинающееся со слова «Бот,»/«ИИ:» (с запятой или двоеточием,
+         чтобы не реагировать на фразы вроде «бот не работает»). */
+      const wordMatch = /^(?:бот|ии|ai|bot)\s*[,:]\s*([\s\S]*)$/i.exec(rawText);
       if (askCmdMatch) {
         askQuery = askCmdMatch[1].trim();
+      } else if (wordMatch) {
+        askQuery = wordMatch[1].trim();
       } else if (botUsername) {
         const mentionRe = new RegExp("@" + botUsername.replace(/[.*+?^${}()|\[\]\\]/g, "\\$&"), "i");
         if (mentionRe.test(rawText)) {
@@ -1719,7 +1742,7 @@ bot.on("message", async (ctx) => {
         }
       }
       if (isBareAskCmd || (askQuery !== null && !askQuery)) {
-        await ctx.reply("Напишите вопрос или поручение после /ask (или после упоминания бота).", { reply_to_message_id: msg.message_id }).catch(() => {});
+        await ctx.reply("Напишите вопрос в том же сообщении. Подробнее: /help", { reply_to_message_id: msg.message_id }).catch(() => {});
         return;
       }
       if (askQuery) {
@@ -1764,7 +1787,14 @@ bot.on("message", async (ctx) => {
     }
 
     const num = await redis.get(groupRouteKey(msg.reply_to_message.message_id));
-    if (!num) return;
+    if (!num) {
+      /* Ответили на сообщение бота, которое не привязано к задаче/ИИ —
+         раньше бот молчал, и было непонятно, ушёл ли ответ. Подсказываем. */
+      if (bot.botInfo && msg.reply_to_message.from && msg.reply_to_message.from.id === bot.botInfo.id) {
+        await ctx.reply("ℹ️ Это сообщение не связано с задачей — ответ никуда не ушёл. Чтобы ответить клиенту, ответьте на карточку задачи. Подсказка: /help", { reply_to_message_id: msg.message_id }).catch(() => {});
+      }
+      return;
+    }
     const task = await redis.get(taskKey(Number(num)));
     if (!task) return;
 
@@ -1801,11 +1831,21 @@ bot.on("message", async (ctx) => {
       await redis.set(taskKey(Number(num)), task);
     }
 
-    const clientLang = (await getUser(task.client))?.lang || "ru";
-    const label = await bot.api.sendMessage(task.client, T[clientLang].fromAcc(task.num));
-    await redis.set(clientRouteKey(task.client, label.message_id), task.num);
-    const copied = await bot.api.copyMessage(task.client, ctx.chat.id, msg.message_id);
-    await redis.set(clientRouteKey(task.client, copied.message_id), task.num);
+    /* Видимое подтверждение: 👍 на сообщении бухгалтера, если клиент
+       получил ответ, или понятное предупреждение, если нет (клиент
+       заблокировал бота и т.п.) — раньше в обоих случаях была тишина. */
+    try {
+      const clientLang = (await getUser(task.client))?.lang || "ru";
+      const label = await bot.api.sendMessage(task.client, T[clientLang].fromAcc(task.num));
+      await redis.set(clientRouteKey(task.client, label.message_id), task.num);
+      const copied = await bot.api.copyMessage(task.client, ctx.chat.id, msg.message_id);
+      await redis.set(clientRouteKey(task.client, copied.message_id), task.num);
+    } catch (e) {
+      console.error("deliver to client:", String(e).slice(0, 200));
+      await ctx.reply(`⚠️ Клиент не получил ответ по задаче №${task.num} (возможно, заблокировал бота). Ответ сохранён в CRM — свяжитесь с клиентом другим способом.`, { reply_to_message_id: msg.message_id }).catch(() => {});
+      return;
+    }
+    await bot.api.setMessageReaction(ctx.chat.id, msg.message_id, [{ type: "emoji", emoji: "👍" }]).catch(() => {});
     return;
   }
 
@@ -2018,6 +2058,12 @@ async function setupBotProfile() {
   for (const lng of ["ru", "uz", "en"]) {
     await bot.api.setMyCommands(PROFILE.commands[lng], { language_code: lng });
   }
+  /* В группе бухгалтеров меню «/» показывает только то, что там нужно —
+     без клиентских команд (/new, /tasks, /password…), которые путают. */
+  await bot.api.setMyCommands([
+    { command: "help", description: "Как пользоваться ботом" },
+    { command: "ask", description: "Спросить ИИ-бухгалтера" },
+  ], { scope: { type: "all_group_chats" } });
   done.push("commands");
   await bot.api.raw.setMyDescription({ description: PROFILE.description.ru });
   for (const lng of ["ru", "uz", "en"]) {
