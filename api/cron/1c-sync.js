@@ -22,6 +22,7 @@
 
 const jwt = require("jsonwebtoken");
 const redis = require("../../lib/redisClient.js");
+const { sleep } = require("../../lib/httpRetry.js");
 const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 async function tgToGroup(payload) {
   if (!TG_TOKEN) return null;
@@ -111,6 +112,9 @@ module.exports = async (req, res) => {
         row.departments = await callApi1c(token, { action: "sync_departments", app: a.code });
       }
       results.push(row);
+             /* пауза между базами — вместе со staggered pingAll() в api/1c.js
+                      снижает давление на общий лимит запросов Clobus на абонента */
+             if (ready.indexOf(a) < ready.length - 1) await sleep(500);
     }
 
     /* Мониторинг: раньше сбой синка был виден только если кто-то открывал
