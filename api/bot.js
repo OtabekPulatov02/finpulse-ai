@@ -974,6 +974,20 @@ async function sendToGroup(fn) {
 }
 
 /* ---------------- Команды: личный чат ---------------- */
+
+/* Общая проверка для команд личного чата, которым нужен уже выбранный язык
+   (т.е. прошедший первый шаг /start). Раньше каждая такая команда отдельно
+      повторяла проверку isPrivate + getUser + "не онбордился" — вынесено сюда. */
+async function requireOnboardedUser(ctx) {
+     if (!isPrivate(ctx)) return null;
+     const u = await getUser(ctx.from.id);
+     if (!u || !u.lang) {
+            await ctx.reply(HELLO, { reply_markup: LANG_KB, parse_mode: "HTML" });
+            return null;
+     }
+     return u;
+}
+
 bot.command("start", async (ctx) => {
   if (!isPrivate(ctx)) return;
   const u = await getUser(ctx.from.id);
@@ -1000,36 +1014,32 @@ bot.command("help", async (ctx) => {
 });
 
 bot.command(["new", "cancel"], async (ctx) => {
-  if (!isPrivate(ctx)) return;
-  const u = await getUser(ctx.from.id);
-  if (!u || !u.lang) return ctx.reply(HELLO, { reply_markup: LANG_KB, parse_mode: "HTML" });
-  u.state = "idle";
+    const u = await requireOnboardedUser(ctx);
+     if (!u) return;
+   u.state = "idle";
   u.draft = null;
   await setUser(ctx.from.id, u);
   return ctx.reply(T[u.lang].idleHint, { reply_markup: mainKb(u.lang) });
 });
 
 bot.command("tasks", async (ctx) => {
-  if (!isPrivate(ctx)) return;
-  const u = await getUser(ctx.from.id);
-  if (!u || !u.lang) return ctx.reply(HELLO, { reply_markup: LANG_KB, parse_mode: "HTML" });
-  return listTasks(ctx, u);
+    const u = await requireOnboardedUser(ctx);
+     if (!u) return;
+   return listTasks(ctx, u);
 });
 
 bot.command("company", async (ctx) => {
-  if (!isPrivate(ctx)) return;
-  const u = await getUser(ctx.from.id);
-  if (!u || !u.lang) return ctx.reply(HELLO, { reply_markup: LANG_KB, parse_mode: "HTML" });
-  u.state = "company";
+    const u = await requireOnboardedUser(ctx);
+     if (!u) return;
+   u.state = "company";
   await setUser(ctx.from.id, u);
   return ctx.reply(T[u.lang].askCompany);
 });
 
 bot.command("password", async (ctx) => {
-  if (!isPrivate(ctx)) return;
-  const u = await getUser(ctx.from.id);
-  if (!u || !u.lang) return ctx.reply(HELLO, { reply_markup: LANG_KB, parse_mode: "HTML" });
-  if (!u.phone) return ctx.reply(T[u.lang].askPhone, { reply_markup: phoneKb(T[u.lang]) });
+    const u = await requireOnboardedUser(ctx);
+     if (!u) return;
+   if (!u.phone) return ctx.reply(T[u.lang].askPhone, { reply_markup: phoneKb(T[u.lang]) });
   const password = await issueClientPassword(ctx, u);
   await setUser(ctx.from.id, u);
   if (!password) {
