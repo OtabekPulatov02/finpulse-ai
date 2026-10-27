@@ -19,8 +19,7 @@
 
 const redis = require("../lib/redisClient.js");
 
-const { fetchWithRetry } = require("../lib/httpRetry.js");
-
+const { fetchWithRetry, sleep } = require("../lib/httpRetry.js");
 const BASE = process.env.ODATA_1C_BASE || "https://clobus.uz";
 const LOGIN = process.env.ODATA_1C_LOGIN || "";
 const PASSWORD = process.env.ODATA_1C_PASSWORD || "";
@@ -79,23 +78,35 @@ async function logEvent(event, data) {
 
 /* ---- ping всех баз: доступен ли OData и настроен ли состав ---- */
 async function pingAll() {
-  const apps = await getApps();
-  const results = await Promise.all(apps.map(async (a) => {
-    try {
-      const r = await odata(a.path, "", "$format=json");
-      const entities = r.json && Array.isArray(r.json.value) ? r.json.value.length : null;
-      return {
-        ...a,
-        reachable: r.status === 200,
-        status: r.status,
-        entities,
-        ready: r.status === 200 && (entities ?? 0) > 0,
-      };
-    } catch (e) {
-      return { ...a, reachable: false, entities: null, ready: false, error: String(e).slice(0, 120) };
-    }
-  }));
-  return results;
+     const apps = await getApps();
+     /* Раньше били все базы абонента 6366 одним Promise.all — залпом
+          параллельных запросов. У Clobus общий лимит на абонента, и этот
+               залп сам по себе выбивал его, роняя HTTP 429 на весь дальнейший
+                    синк (см. lib/httpRetry.js). Теперь пингуем небольшими пачками с
+                         паузой между ними. */
+     const CONCURRENCY = 3;
+     const results = [];
+     for (let i = 0; i < apps.length; i += CONCURRENCY) {
+            const batch = apps.slice(i, i + CONCURRENCY);
+            const batchResults = await Promise.all(batch.map(async (a) => {
+                     try {
+                                const r = await odata(a.path, "", "$format=json");
+                                const entities = r.json && Array.isArray(r.json.value) ? r.json.value.length : null;
+                                return {
+                                             ...a,
+                                             reachable: r.status === 200,
+                                             status: r.status,
+                                             entities,
+                                             ready: r.status === 200 && (entities ?? 0) > 0,
+                                };
+                     } catch (e) {
+                                return { ...a, reachable: false, entities: null, ready: false, error: String(e).slice(0, 120) };
+                     }
+            }));
+            results.push(...batchResults);
+            if (i + CONCURRENCY < apps.length) await sleep(400);
+     }
+     return results;
 }
 
 /* ---- организации приложения (после включения состава OData) ---- */
