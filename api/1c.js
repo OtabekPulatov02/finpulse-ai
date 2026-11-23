@@ -20,6 +20,7 @@
 const redis = require("../lib/redisClient.js");
 
 const { fetchWithRetry, sleep } = require("../lib/httpRetry.js");
+const { getSaldo } = require("../lib/balance.js");
 const BASE = process.env.ODATA_1C_BASE || "https://clobus.uz";
 const LOGIN = process.env.ODATA_1C_LOGIN || "";
 const PASSWORD = process.env.ODATA_1C_PASSWORD || "";
@@ -652,48 +653,20 @@ async function departmentRefFor(appPath, name) {
   return scored.length ? { ref: scored[0].ref, name: scored[0].name } : null;
 }
 
-/* ---------- Обороты по счёту (регистр бухгалтерии "Хозрасчетный") ----------
-   Субконто (аналитика по контрагентам) не публикуется в этой конфигурации через
-   стандартный OData-интерфейс, поэтому точную задолженность конкретного контрагента
-   получить так нельзя — но обороты/движения по счёту за период доступны и полезны
-   (напр. "сколько прошло по счёту 5110 за июль"). */
-async function getAccountTurnover(appPath, accountCode, dateFrom, dateTo) {
-  /* accountCode/dateFrom/dateTo сейчас приходят только от admin-агента (ИИ),
-     но собираются в $filter прямой строковой конкатенацией — без валидации
-     значение с одинарной кавычкой сломало бы фильтр или дописало произвольное
-     условие OData. Агент обычно передаёт чистые значения, но не полагаемся
-     на это: жёстко проверяем форму на входе. */
+/* ---------- Обороты по счёту ----------
+   Старый алиас r=turnover. Считается через getSaldo (lib/balance.js): прежний
+   способ с $filter по коду счёта Clobus не поддерживает (HTTP 500). */
+async function getAccountTurnover(appPath, accountCode, dateFrom, dateTo, org) {
   if (!/^[0-9.]{1,20}$/.test(String(accountCode || ""))) {
     return { ok: false, error: "Некорректный код счёта" };
   }
-  if ((dateFrom && !/^\d{4}-\d{2}-\d{2}$/.test(dateFrom)) || (dateTo && !/^\d{4}-\d{2}-\d{2}$/.test(dateTo))) {
-    return { ok: false, error: "Некорректный формат даты (ожидается YYYY-MM-DD)" };
-  }
-  const from = dateFrom ? `${dateFrom}T00:00:00` : null;
-  const to = dateTo ? `${dateTo}T23:59:59` : null;
-  const dateFilter = (from && to) ? ` and Period ge datetime'${from}' and Period le datetime'${to}'` : "";
-  const baseSelect = "$select=Сумма,Period,AccountDr_Key,AccountCr_Key&$top=2000&$format=json";
-
-  const drRes = await odata(appPath, "AccountingRegister_Хозрасчетный_RecordType",
-    `${baseSelect}&$filter=AccountDr/Code eq '${String(accountCode)}'${dateFilter}`);
-  const crRes = await odata(appPath, "AccountingRegister_Хозрасчетный_RecordType",
-    `${baseSelect}&$filter=AccountCr/Code eq '${String(accountCode)}'${dateFilter}`);
-
-  if (drRes.status === 404 || crRes.status === 404) {
-    return { ok: false, error: "AccountingRegister_Хозрасчетный не включён в состав OData — настройте состав REST-сервиса" };
-  }
-  if (drRes.status === 401 || crRes.status === 401) return { ok: false, error: "auth: проверьте ODATA_1C_LOGIN/PASSWORD" };
-  if (drRes.status !== 200 || crRes.status !== 200) {
-    return { ok: false, error: `HTTP ${drRes.status}/${crRes.status}` };
-  }
-
-  const debit = (drRes.json?.value || []).reduce((s, r) => s + (Number(r["Сумма"]) || 0), 0);
-  const credit = (crRes.json?.value || []).reduce((s, r) => s + (Number(r["Сумма"]) || 0), 0);
+  const r = await getSaldo(appPath, { account: accountCode, from: dateFrom, to: dateTo, org });
+  if (!r.ok) return r;
   return {
-    ok: true, account: String(accountCode), from: dateFrom || null, to: dateTo || null,
-    debitTurnover: debit, creditTurnover: credit, net: debit - credit,
-    rowsDr: (drRes.json?.value || []).length, rowsCr: (crRes.json?.value || []).length,
-    note: "Обороты по счёту за период (без субконто по контрагентам — эта аналитика не публикуется через OData в данной конфигурации).",
+    ok: true, account: String(accountCode), from: r.from, to: r.to, orgs: r.orgs,
+    debitTurnover: r.totals.debit, creditTurnover: r.totals.credit, net: r.totals.debit - r.totals.credit,
+    openingBalance: r.totals.opening, closingBalance: r.totals.closing,
+    rows: r.rows, note: r.note,
   };
 }
 
@@ -1332,7 +1305,12 @@ module.exports = async (req, res) => {
       if (q.r === "turnover" && q.app && q.account) {
         const a = findApp(q.app);
         if (!a) return res.status(200).json({ ok: false, error: "unknown app" });
-        return res.status(200).json(await getAccountTurnover(a.path, q.account, q.from, q.to));
+        return res.status(200).json(await getAccountTurnover(a.path, q.account, q.from, q.to, q.org));
+      }
+      if (q.r === "saldo" && q.app) {
+        const a = findApp(q.app);
+        if (!a) return res.status(200).json({ ok: false, error: "unknown app" });
+        return res.status(200).json(await getSaldo(a.path, { org: q.org, account: q.account, from: q.from, to: q.to }));
       }
       if (q.r === "doclog") {
         const limit = Math.min(Number(q.limit) || 50, 200);
