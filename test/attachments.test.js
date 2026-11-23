@@ -37,3 +37,23 @@ test("голосовые и видео пропускаются без запр�
   assert.strictEqual(r.ok, false);
   assert.strictEqual(r.skipped.length, 1);
 });
+
+test("файл из браузера (kind: upload) читается без Telegram", async () => {
+  process.env.OPENAI_API_KEY = "sk-test";
+  let sent = null;
+  const orig = global.fetch;
+  global.fetch = async (url, init) => {
+    if (!String(url).includes("openai")) throw new Error("unexpected " + url);
+    sent = JSON.parse(init.body);
+    return { ok: true, status: 200, text: async () => JSON.stringify({ model: "m", choices: [{ message: { content: '{"docs":[{"docType":"счёт","number":"7"}]}' } }] }) };
+  };
+  try {
+    const r = await extractAttachments([
+      { kind: "upload", name: "a.pdf", mime: "application/pdf", data: Buffer.from("%PDF-1.1").toString("base64") },
+      { kind: "upload", name: "b.exe", mime: "application/x-msdownload", data: "AAAA" },
+    ]);
+    assert.strictEqual(r.ok, true);
+    assert.ok(sent.messages[1].content.some((p) => p.type === "file" && p.file.filename === "a.pdf"));
+    assert.strictEqual(r.skipped.length, 1);
+  } finally { global.fetch = orig; }
+});
