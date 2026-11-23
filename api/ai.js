@@ -185,7 +185,7 @@ async function runAgent(messages, authHeaders, opts = {}) {
     if (left < 6000) {
       return { reply: "⏱ Задача большая — не успел закончить за отведённое время. Напишите «продолжи», и я доделаю.", steps, model: MODEL };
     }
-    const out = await openaiChat({ model: MODEL, messages: convo, tools: AGENT_TOOLS, maxTokens: 4000, temperature: 0.1, timeoutMs: Math.min(40000, left - 2000) });
+    const out = await openaiChat({ model: MODEL, messages: convo, tools: AGENT_TOOLS, maxTokens: 4000, temperature: 0.1, timeoutMs: Math.min(40000, left - 2000), reasoning: MODEL === modelStrong() ? "medium" : undefined });
     void logUsage(redis, out.usage, out.model);
     void checkBudget();
     const data = { choices: [{ message: out.message }] };
@@ -833,11 +833,19 @@ module.exports = async (req, res) => {
             try {
               const out = await openaiChat({ model: m, messages: [{ role: "user", content: 'Ответь JSON {"pong": true}' }], maxTokens: 200, json: true, timeoutMs: 20000 });
               let pong = false; try { pong = !!JSON.parse(out.message.content || "{}").pong; } catch (e) { /* noop */ }
-              return { requested: m, answered: out.model, fellBack: out.fellBack, ok: pong };
+              return { requested: m, answered: out.model, fellBack: out.fellBack, api: out.api, ok: pong };
             } catch (e) { return { requested: m, ok: false, error: String(e).slice(0, 200) }; }
           };
-          const [a, b] = await Promise.all([probe(model), probe(strong)]);
-          return res.status(200).json({ ok: a.ok && !a.fellBack, key: true, model, strong, live: true, main: a, strongProbe: b });
+          /* Путь агента: та же модель, но с инструментом (Responses API) */
+          const probeTools = async (m) => {
+            try {
+              const out = await openaiChat({ model: m, messages: [{ role: "user", content: "Вызови инструмент ping." }], tools: [{ type: "function", function: { name: "ping", description: "проверка", parameters: { type: "object", properties: {} } } }], maxTokens: 300, timeoutMs: 25000 });
+              const called = !!(out.message.tool_calls || []).find((t) => t.function.name === "ping");
+              return { requested: m, answered: out.model, fellBack: out.fellBack, api: out.api, ok: called };
+            } catch (e) { return { requested: m, ok: false, error: String(e).slice(0, 200) }; }
+          };
+          const [a, b, c] = await Promise.all([probe(model), probe(strong), probeTools(model)]);
+          return res.status(200).json({ ok: a.ok && !a.fellBack && c.ok && !c.fellBack, key: true, model, strong, live: true, main: a, strongProbe: b, agentTools: c });
         }
         return res.status(200).json({ ok: true, key: true, model, strong });
       }
