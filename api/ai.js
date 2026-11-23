@@ -13,6 +13,9 @@ const redis = require("../lib/redisClient.js");
 const { chat, classifyTask, draftFromTask, summarizeThread } = require("../lib/ai.js");
 const { buildClientContext, getMemory, addMemory, getUsage, logUsage, getMonthlyCostUsd } = require("../lib/brain.js");
 const { CONSTITUTION, DEFAULT_CATEGORIES } = require("../lib/knowledge.js");
+const { openaiChat, modelMain, modelStrong } = require("../lib/openai.js");
+const taxLib = require("../lib/tax.js");
+const { extractAttachments, docsToText } = require("../lib/attachments.js");
 
 
 const DEFAULT_SETTINGS = { classify: true, drafts: true, summarize: true, autoWork: false };
@@ -62,6 +65,13 @@ onec_post: {action:"sync_orgs", app} | {action:"sync_counterparties", app} | {ac
 Кадровые документы (hr_leave/hr_hire/hr_fire) требуют draft.employee (точное ФИО сотрудника) — резолвится по синку сотрудников (sync_employees), сначала точное совпадение. Сотрудника НИКОГДА не создавай автоматически (в отличие от контрагента) — если execute_task вернул employeeAmbiguous:true, спроси пользователя (suggestions — похожие варианты с ref) и вызови execute_task повторно с employeeRef:<ref> при выборе, либо уточни точное ФИО. Для hr_leave также передавай draft.hrDate (дата начала отпуска) и draft.hrDays (число дней); для hr_hire/hr_fire — draft.hrDate (дата приёма/увольнения).
 НЕ путай это с самим ЭДО (Didox) — фактическая отправка документа контрагенту через систему электронного документооборота и получение подписи НЕ реализована (нет интеграции с Didox API), это отдельная задача. Если просят создать документ одного из поддерживаемых типов (в т.ч. ЭСФ) — выполняй через execute_task как обычно. Если явно просят отправить/подписать через ЭДО/Didox — скажи, что этой интеграции пока нет, и не пытайся выполнить это через 1С.
 
+Дополнительные инструменты (считают/читают КОД и 1С, а не память модели — используй их вместо прикидок в уме):
+- tax_calc {kind, ...} — точные налоговые расчёты РУз: vat_extract{amount} (выделить НДС из суммы с НДС), vat_add{amount}, payroll{gross, budget?} (НДФЛ, ИНПС, на руки, соцналог, затраты работодателя), payroll_net{net} (сколько начислить, чтобы на руки было net), turnover{revenue, ip?}, profit{income, expenses}, dividend{amount}, rates (текущие ставки). Любые цифры налогов и зарплаты — ТОЛЬКО через tax_calc.
+- read_attachments {num, question?} — прочитать вложения задачи (фото счёта, скан, PDF, txt/csv): тип документа, номер, дата, стороны, ИНН, суммы, НДС, позиции, срок оплаты. Вызывай, когда в задаче есть файлы и нужно знать их содержимое (оплата по счёту, ЭСФ, сверка, проверка документа).
+- Сальдо и обороты 1С — onec_get r=saldo. Счета НСБУ РУз: 5010 касса, 5110 расчётный счёт, 5210 валютный счёт, 4010 счета к получению от покупателей (дебиторка), 4310 авансы выданные, 6010 счета к оплате поставщикам (кредиторка), 6310 авансы полученные, 6410 задолженность по налогам, 6520 по соцстраху, 6710 расчёты с персоналом по оплате труда, 9010 доходы от реализации. Дебиторка/кредиторка/«сколько должны» — через r=saldo по 4010/6010 и т.п.; деньги на счетах — 5110/5010/5210.
+
+Что ты умеешь (рассказывай, если спрашивают «что ты умеешь»): задачи и клиенты CRM (создать, найти, сменить статус/исполнителя, сроки), календарь налогов и платежей, сотрудники, тарифы; 1С: организации, контрагенты, номенклатура, договоры, сотрудники, сальдо/обороты/остатки денег/дебиторка/кредиторка, создание НЕПРОВЕДЁННЫХ документов (платежи, ЭСФ, счёт, поступление, реализация, акт сверки, доверенность, кадровые приказы); чтение фото и PDF документов клиента; налоговые и зарплатные расчёты; черновики договоров по шаблонам; база знаний и память о клиентах.
+
 Правила:
 1. Всегда сначала читай данные (crm_get), потом действуй.
 2. Деструктивные действия (delete, сброс пароля, массовые изменения) — только после явного подтверждения в диалоге. Если его нет — опиши, что собираешься сделать, и спроси.
@@ -78,6 +88,8 @@ onec_post: {action:"sync_orgs", app} | {action:"sync_counterparties", app} | {ac
    Черновик договора — это ТЕКСТ для проверки бухгалтером/юристом перед отправкой контрагенту, а не проведённый в 1С документ — всегда явно говори пользователю, что это черновик и нужна проверка.`;
 
 const AGENT_TOOLS = [
+  { type: "function", function: { name: "tax_calc", description: "Точный налоговый/зарплатный расчёт по ставкам РУз. kind: vat_extract|vat_add|payroll|payroll_net|turnover|profit|dividend|rates. Аргументы по kind: amount | gross,budget | net | revenue,ip | income,expenses | rate (необязательно, своя ставка в %).", parameters: { type: "object", properties: { kind: { type: "string" }, amount: { type: "number" }, gross: { type: "number" }, net: { type: "number" }, revenue: { type: "number" }, income: { type: "number" }, expenses: { type: "number" }, rate: { type: "number" }, ip: { type: "boolean" }, budget: { type: "boolean" } }, required: ["kind"] } } },
+  { type: "function", function: { name: "read_attachments", description: "Прочитать вложения задачи CRM (фото/скан/PDF/txt/csv) и вернуть извлечённые данные документов: тип, номер, дата, стороны, ИНН, суммы, НДС, позиции, срок оплаты.", parameters: { type: "object", properties: { num: { type: "number" }, question: { type: "string" } }, required: ["num"] } } },
   { type: "function", function: { name: "crm_get", description: "GET-запрос к /api/crm. Аргумент query — строка после ?, напр. \"r=tasks\"", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
   { type: "function", function: { name: "crm_post", description: "POST к /api/crm. body — объект действия, напр. {\"action\":\"status\",\"num\":106,\"status\":\"done\"}", parameters: { type: "object", properties: { body: { type: "object" } }, required: ["body"] } } },
   { type: "function", function: { name: "onec_get", description: "GET к /api/1c (интеграция 1С). query напр. \"r=ping\"", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } } },
@@ -126,15 +138,18 @@ const COMPLEX_TASK_KEYWORDS = [
   "требование гни", "требование гнс", "налоговая проверка", "выездная проверка",
   "камеральная проверка", "акт проверки", "штраф", "пеня", "судебн", "претензия",
   "апелляц", "жалоба", "спор по договору", "расторжение договора", "иск",
+  "сверь", "проанализируй", "анализ", "отчёт за", "отчет за", "баланс", "прибыль и убыт",
+  "оптимиз", "сравни", "аудит", "почему не сходится", "расхожден",
 ];
 
-function pickModel(messages) {
-  const strong = process.env.OPENAI_MODEL_STRONG || "gpt-4o";
-  const cheap = process.env.OPENAI_MODEL || "gpt-4o-mini";
+function pickModel(messages, opts = {}) {
+  const strong = modelStrong();
+  const main = modelMain();
+  if (opts.forceStrong) return strong;
   const lastUserMsgs = (messages || []).filter((m) => m.role === "user").slice(-3);
   const text = lastUserMsgs.map((m) => (typeof m.content === "string" ? m.content : "")).join(" ").toLowerCase();
   const isComplex = COMPLEX_TASK_KEYWORDS.some((kw) => text.includes(kw));
-  return isComplex ? strong : cheap;
+  return isComplex ? strong : main;
 }
 
 /* Месячный бюджет на AI (env AI_MONTHLY_BUDGET_USD, необязательный) —
@@ -157,27 +172,28 @@ async function checkBudget() {
   } catch (e) { /* noop */ }
 }
 
-async function runAgent(messages, authHeaders) {
-  const KEY = process.env.OPENAI_API_KEY;
-  const MODEL = pickModel(messages);
-  const convo = [{ role: "system", content: AGENT_SYSTEM }, ...messages.slice(-20)];
+const AGENT_MAX_STEPS = 14;
+const AGENT_TIME_BUDGET_MS = 47000; /* maxDuration 60с, бот в группе ждёт 55с */
+
+async function runAgent(messages, authHeaders, opts = {}) {
+  const started = Date.now();
+  const MODEL = pickModel(messages, opts);
+  const convo = [{ role: "system", content: AGENT_SYSTEM }, ...messages.slice(-40)];
   const steps = [];
-  for (let i = 0; i < 8; i++) {
-    const r = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${KEY}` },
-      body: JSON.stringify({ model: MODEL, messages: convo, tools: AGENT_TOOLS, temperature: 0.1, max_tokens: 900 }),
-      signal: AbortSignal.timeout(45000),
-    });
-    if (!r.ok) throw new Error(`OpenAI HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
-    const data = await r.json();
-    void logUsage(redis, data.usage, MODEL);
+  for (let i = 0; i < AGENT_MAX_STEPS; i++) {
+    const left = AGENT_TIME_BUDGET_MS - (Date.now() - started);
+    if (left < 6000) {
+      return { reply: "⏱ Задача большая — не успел закончить за отведённое время. Напишите «продолжи», и я доделаю.", steps, model: MODEL };
+    }
+    const out = await openaiChat({ model: MODEL, messages: convo, tools: AGENT_TOOLS, maxTokens: 4000, temperature: 0.1, timeoutMs: Math.min(40000, left - 2000) });
+    void logUsage(redis, out.usage, out.model);
     void checkBudget();
+    const data = { choices: [{ message: out.message }] };
     const msg = data.choices?.[0]?.message;
     if (!msg) throw new Error("empty completion");
     convo.push(msg);
     if (!msg.tool_calls || !msg.tool_calls.length) {
-      return { reply: msg.content || "(пустой ответ)", steps };
+      return { reply: msg.content || "(пустой ответ)", steps, model: MODEL };
     }
     let askResult = null;
     for (const tc of msg.tool_calls) {
@@ -188,6 +204,26 @@ async function runAgent(messages, authHeaders) {
         const options = Array.isArray(args.options) ? args.options.map(String).slice(0, 8) : [];
         result = JSON.stringify({ ok: true, note: "вопрос показан пользователю, жду ответа" });
         askResult = { reply: String(args.question || "Уточните, пожалуйста"), steps, askOptions: options, awaitingConfirmation: true };
+      } else if (tc.function.name === "tax_calc") {
+        try {
+          const rates = await taxLib.getRates(redis);
+          const { kind, ...rest } = args;
+          result = JSON.stringify(taxLib.calc(String(kind || ""), rest, rates));
+        } catch (e) { result = JSON.stringify({ ok: false, error: String(e).slice(0, 200) }); }
+      } else if (tc.function.name === "read_attachments") {
+        try {
+          const task = await redis.get("task:" + Number(args.num));
+          if (!task) result = JSON.stringify({ ok: false, error: "task not found" });
+          else if (!Array.isArray(task.files) || !task.files.length) result = JSON.stringify({ ok: false, error: "в задаче нет вложений" });
+          else {
+            const ex = await extractAttachments(task.files, { question: args.question || task.text, redis, logUsage });
+            if (ex.ok) {
+              task.aiAttachments = { docs: ex.docs, at: new Date().toISOString() };
+              await redis.set("task:" + Number(args.num), task);
+            }
+            result = JSON.stringify({ ok: ex.ok, docs: ex.docs, skipped: ex.skipped, error: ex.error });
+          }
+        } catch (e) { result = JSON.stringify({ ok: false, error: String(e).slice(0, 200) }); }
       } else if (tc.function.name === "memory_get") {
         result = JSON.stringify({ ok: true, memory: await getMemory(redis, String(args.company || "")) });
       } else if (tc.function.name === "memory_add") {
@@ -295,7 +331,7 @@ async function runAgent(messages, authHeaders) {
     }
     if (askResult) return askResult;
   }
-  return { reply: "Достигнут лимит шагов — уточните задачу или разбейте её на части.", steps };
+  return { reply: "Достигнут лимит шагов — уточните задачу или разбейте её на части.", steps, model: MODEL };
 }
 
 
@@ -788,17 +824,22 @@ module.exports = async (req, res) => {
 
     if (req.method === "GET") {
       if (q.r === "ping") {
-        const model = process.env.OPENAI_MODEL || "gpt-4o-mini";
-        if (!hasKey) return res.status(200).json({ ok: false, key: false, model, error: "OPENAI_API_KEY не задан в Vercel" });
+        const model = modelMain();
+        const strong = modelStrong();
+        if (!hasKey) return res.status(200).json({ ok: false, key: false, model, strong, error: "OPENAI_API_KEY не задан в Vercel" });
         if (q.test) {
-          try {
-            const r = await chat([{ role: "user", content: 'Ответь JSON {"pong": true}' }], { maxTokens: 20, timeoutMs: 10000 });
-            return res.status(200).json({ ok: !!r.pong, key: true, model, live: true });
-          } catch (e) {
-            return res.status(200).json({ ok: false, key: true, model, error: String(e).slice(0, 200) });
-          }
+          /* Живая проверка обеих моделей: какая реально ответила (или откат на запасную) */
+          const probe = async (m) => {
+            try {
+              const out = await openaiChat({ model: m, messages: [{ role: "user", content: 'Ответь JSON {"pong": true}' }], maxTokens: 200, json: true, timeoutMs: 20000 });
+              let pong = false; try { pong = !!JSON.parse(out.message.content || "{}").pong; } catch (e) { /* noop */ }
+              return { requested: m, answered: out.model, fellBack: out.fellBack, ok: pong };
+            } catch (e) { return { requested: m, ok: false, error: String(e).slice(0, 200) }; }
+          };
+          const [a, b] = await Promise.all([probe(model), probe(strong)]);
+          return res.status(200).json({ ok: a.ok && !a.fellBack, key: true, model, strong, live: true, main: a, strongProbe: b });
         }
-        return res.status(200).json({ ok: true, key: true, model });
+        return res.status(200).json({ ok: true, key: true, model, strong });
       }
       if (q.r === "chats") {
         return res.status(200).json({ ok: true, chats: await listChats() });
@@ -841,10 +882,22 @@ module.exports = async (req, res) => {
       if (body && body.action === "agent" && Array.isArray(body.messages)) {
         const isAdmin = !JWT_SECRET || (authUser && authUser.role === "admin");
         if (!isAdmin) return res.status(403).json({ ok: false, error: "только супер-админ" });
-        const out = await runAgent(body.messages, {
+        /* Вложения из Telegram (фото/PDF, на которые ответили «Бот, …») —
+           читаем заранее и добавляем к последнему сообщению текстом. */
+        let messages = body.messages;
+        if (Array.isArray(body.attachments) && body.attachments.length) {
+          try {
+            const ex = await extractAttachments(body.attachments, { question: String((messages[messages.length - 1] || {}).content || ""), redis, logUsage });
+            const note = ex.ok
+              ? "\n\n[Данные из приложенных файлов]\n" + docsToText(ex.docs) + "\n[JSON]" + JSON.stringify(ex.docs).slice(0, 6000)
+              : "\n\n[Файлы приложены, но прочитать не удалось: " + ((ex.skipped || []).map((x) => x.name + " — " + x.reason).join("; ") || ex.error || "ошибка") + "]";
+            messages = messages.slice(0, -1).concat([{ ...messages[messages.length - 1], content: String((messages[messages.length - 1] || {}).content || "") + note }]);
+          } catch (e) { /* без вложений */ }
+        }
+        const out = await runAgent(messages, {
           ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}),
           ...(req.headers["x-api-key"] ? { "x-api-key": req.headers["x-api-key"] } : {}),
-        });
+        }, { forceStrong: !!body.strong });
         let chatId = body.chatId || null;
         try { chatId = await persistChat(body.chatId, body.messages, out.reply, out.steps); } catch (e) { /* noop */ }
         await logEvent("ai_agent_run", { steps: out.steps.length, by: actor });

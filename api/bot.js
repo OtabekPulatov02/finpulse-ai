@@ -89,7 +89,22 @@ async function askAiInGroup(ctx, query, msg, priorHistory) {
   }
   const byName = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(" ") || "Бухгалтер";
   const history = Array.isArray(priorHistory) ? priorHistory : [];
-  const messages = history.concat([{ role: "user", content: query }]);
+  /* Контекст сообщения: файлы (фото/PDF в самом сообщении или в том, на
+     которое ответили) и номер задачи, если ответили на её карточку. */
+  const attachments = [];
+  let contextNote = "";
+  for (const m of [msg, msg.reply_to_message]) {
+    if (!m) continue;
+    const f = extractFile(m);
+    if (f && (f.kind === "photo" || f.kind === "document")) attachments.push(f);
+  }
+  if (msg.reply_to_message) {
+    try {
+      const routedNum = await redis.get(groupRouteKey(msg.reply_to_message.message_id));
+      if (routedNum) contextNote = `\n\n[Вопрос задан ответом на сообщение по задаче №${routedNum}]`;
+    } catch (e) { /* noop */ }
+  }
+  const messages = history.concat([{ role: "user", content: query + contextNote }]);
   await ctx.replyWithChatAction("typing").catch(() => {});
   let typingTimer = setInterval(() => ctx.replyWithChatAction("typing").catch(() => {}), 4000);
   try {
@@ -98,7 +113,7 @@ async function askAiInGroup(ctx, query, msg, priorHistory) {
     const r = await fetch(`${AUTOWORK_API_ORIGIN}/api/ai`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ action: "agent", messages }),
+      body: JSON.stringify({ action: "agent", messages, ...(attachments.length ? { attachments } : {}) }),
       signal: AbortSignal.timeout(55000),
     }).then((x) => x.json()).catch((e) => ({ ok: false, error: String(e).slice(0, 200) }));
     clearInterval(typingTimer);
@@ -1073,6 +1088,8 @@ function groupHelp() {
   return "<b>Как пользоваться ботом в группе</b>\n\n" +
     "💬 <b>Ответить клиенту</b> — нажмите «Ответить» на карточку задачи и напишите текст или прикрепите файл. Бот поставит 👍, когда клиент получит ответ.\n\n" +
     "🤖 <b>Спросить ИИ-бухгалтера</b> — " + askHow + "\n\n" +
+    "📎 <b>Документ</b> — пришлите фото или PDF с подписью «Бот, что это за счёт?» или ответьте «Бот, …» на файл — ИИ прочитает его.\n\n" +
+    "🧮 <b>Расчёты</b> — НДС, зарплата «на руки», соцналог, налог с оборота: «Бот, посчитай зарплату 8 000 000».\n\n" +
     "↩️ <b>Продолжить разговор с ИИ</b> — нажмите «Ответить» на его сообщение.\n\n" +
     "👉 Исполнитель и статус задачи меняются в CRM.";
 }
@@ -1413,8 +1430,29 @@ async function createTaskFromDraft(ctx, u, deferred) {
           }
         } catch (e) { /* noop */ }
 
+        /* Вложения клиента (фото счёта, PDF) — ИИ читает их до разбора,
+           чтобы суммы/ИНН/контрагент шли из документа, а не только из текста.
+           Ограничено по времени: вебхук живёт ≤60 с. */
+        const t0 = Date.now();
+        let attText = "";
+        if (Array.isArray(task.files) && task.files.length && aiSet.readFiles !== false) {
+          try {
+            const { extractAttachments, docsToText } = require("../lib/attachments.js");
+            const { logUsage } = require("../lib/brain.js");
+            const ex = await Promise.race([
+              extractAttachments(task.files, { question: task.text, redis, logUsage }),
+              new Promise((resolve) => setTimeout(() => resolve({ ok: false, timeout: true }), 25000)),
+            ]);
+            if (ex && ex.ok) {
+              task.aiAttachments = { docs: ex.docs, skipped: ex.skipped || [], at: new Date().toISOString() };
+              attText = docsToText(ex.docs);
+            }
+          } catch (e) { console.error("intake attachments:", String(e).slice(0, 200)); }
+        }
+        const textForAi = attText ? `${task.text}\n\nДанные из вложений клиента:\n${attText}` : task.text;
+
         const ai = await intakeTask({
-          text: task.text,
+          text: textForAi,
           company: task.company,
           categories: cats,
           employees,
@@ -1436,12 +1474,12 @@ async function createTaskFromDraft(ctx, u, deferred) {
 
           /* простая типовая задача → сразу готовим черновик операции */
           let draft = null;
-          if (ai.complexity === "simple" && aiSet.drafts !== false) {
+          if (ai.complexity === "simple" && aiSet.drafts !== false && Date.now() - t0 < 38000) {
             try {
               let clientInfo = null;
               const cid = await redis.get("clientcompany:" + normCompany(task.company || ""));
               if (cid) clientInfo = await redis.get("client:" + cid);
-              draft = await draftFromTask(task, clientInfo, { redis });
+              draft = await draftFromTask({ ...task, text: textForAi }, clientInfo, { redis });
               if (draft) task.aiDraft = { ...draft, generatedAt: new Date().toISOString(), by: "AI-бухгалтер" };
             } catch (e) { /* noop */ }
           }
@@ -1463,6 +1501,7 @@ async function createTaskFromDraft(ctx, u, deferred) {
             if (task.dueDate) lines.push(`📅 <b>Срок:</b> ${task.dueDate}`);
             if (task.assignee) lines.push(`👤 <b>Исполнитель:</b> ${e2(task.assignee)} (наименее загружен) — взята в работу`);
             if (ai.operation1c) lines.push(`🧾 <b>Операция 1С:</b> ${e2(ai.operation1c)}`);
+            if (attText) lines.push(`📎 <b>Из вложений:</b>\n${e2(attText.slice(0, 900))}`);
             if (!ai.relevant) lines.push("⚠️ <i>Похоже, заявка не относится к бухгалтерии — уточните у клиента.</i>");
             if (ai.missing.length) lines.push(`❗ <b>Не хватает:</b> ${e2(ai.missing.join(", "))}`);
             if (draft) lines.push("📝 <b>Черновик операции готов</b> — проверьте в CRM.");
