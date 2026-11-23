@@ -1497,7 +1497,7 @@ module.exports = async (req, res) => {
         const { getClientReceivables, getCashEstimate } = require("../lib/balance.js");
         const [receivables, cash] = await Promise.all([
           getClientReceivables(org.app, org.ref).catch((e) => ({ ok: false, error: String(e).slice(0, 200) })),
-          getCashEstimate(org.app).catch((e) => ({ ok: false, error: String(e).slice(0, 200) })),
+          getCashEstimate(org.app, org.ref).catch((e) => ({ ok: false, error: String(e).slice(0, 200) })),
         ]);
         return res.status(200).json({ ok: true, company: org.name, receivables, cash });
       }
