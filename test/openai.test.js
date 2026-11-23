@@ -85,3 +85,16 @@ test("текстовый ответ Responses и выбор пути", () => {
   assert.ok(useResponses("gpt-6.2-sol", [{}]) && !useResponses("gpt-6.2-sol", []) && !useResponses("gpt-4o", [{}]));
   assert.deepStrictEqual(buildResponsesBody("gpt-6.2-astra", { messages: [], maxTokens: 10, json: true, reasoning: "medium" }).text, { format: { type: "json_object" } });
 });
+test("цепочка рассуждений: _rsp возвращается в Responses и не уходит в Chat Completions", () => {
+  const { message } = fromResponses({ output: [
+    { type: "reasoning", id: "rs_1", encrypted_content: "ENC", summary: [] },
+    { type: "function_call", id: "fc_1", call_id: "c1", name: "x", arguments: "{}" },
+  ] });
+  assert.strictEqual(message._rsp.length, 2);
+  const input = toResponsesInput([{ role: "user", content: "q" }, message, { role: "tool", tool_call_id: "c1", content: "{}" }]);
+  assert.deepStrictEqual(input.map((i) => i.type || i.role), ["user", "reasoning", "function_call", "function_call_output"]);
+  assert.strictEqual(input[1].encrypted_content, "ENC");
+  const chat = buildBody("gpt-4o", { messages: [message], maxTokens: 10 });
+  assert.ok(!("_rsp" in chat.messages[0]));
+  assert.ok(buildResponsesBody("gpt-6.2-sol", { messages: [], maxTokens: 10 }).include.includes("reasoning.encrypted_content"));
+});

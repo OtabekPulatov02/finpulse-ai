@@ -147,7 +147,8 @@ function pickModel(messages, opts = {}) {
   const main = modelMain();
   if (opts.forceStrong) return strong;
   const lastUserMsgs = (messages || []).filter((m) => m.role === "user").slice(-3);
-  const text = lastUserMsgs.map((m) => (typeof m.content === "string" ? m.content : "")).join(" ").toLowerCase();
+  /* только слова пользователя: данные из файлов («сверьте реквизиты») не делают запрос сложным */
+  const text = lastUserMsgs.map((m) => (typeof m.content === "string" ? m.content.split("\n\n[Данные из приложенных файлов]")[0].split("\n\n[Файлы приложены")[0] : "")).join(" ").toLowerCase();
   const isComplex = COMPLEX_TASK_KEYWORDS.some((kw) => text.includes(kw));
   return isComplex ? strong : main;
 }
