@@ -43,3 +43,31 @@ test("прочие ошибки не маскируются откатом", asy
   global.fetch = async () => ({ ok: false, status: 429, text: async () => "rate limited" });
   try { await assert.rejects(() => openaiChat({ messages: [] }), /HTTP 429/); } finally { global.fetch = orig; }
 });
+
+test("gpt-6.x: tools + reasoning → повтор с reasoning_effort:none, без отката", async () => {
+  process.env.OPENAI_API_KEY = "sk-test";
+  const { modelOverrides } = require("../lib/openai.js");
+  modelOverrides.clear();
+  const seen = [];
+  const orig = global.fetch;
+  global.fetch = async (url, init) => {
+    const body = JSON.parse(init.body);
+    seen.push({ model: body.model, re: body.reasoning_effort });
+    if (body.tools && body.reasoning_effort !== "none") {
+      return { ok: false, status: 400, text: async () => JSON.stringify({ error: { message: "Function tools with reasoning_effort are not supported for gpt-6.2-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'." } }) };
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify({ model: body.model, choices: [{ message: { content: "ok" } }] }) };
+  };
+  try {
+    const tools = [{ type: "function", function: { name: "x", parameters: { type: "object", properties: {} } } }];
+    const a = await openaiChat({ model: "gpt-6.2-sol", messages: [], tools });
+    assert.strictEqual(a.fellBack, false);
+    assert.deepStrictEqual(seen, [{ model: "gpt-6.2-sol", re: undefined }, { model: "gpt-6.2-sol", re: "none" }]);
+    seen.length = 0;
+    await openaiChat({ model: "gpt-6.2-sol", messages: [], tools });
+    assert.deepStrictEqual(seen, [{ model: "gpt-6.2-sol", re: "none" }], "второй вызов сразу с none");
+    seen.length = 0;
+    await openaiChat({ model: "gpt-6.2-sol", messages: [] });
+    assert.deepStrictEqual(seen, [{ model: "gpt-6.2-sol", re: undefined }], "без tools — reasoning остаётся");
+  } finally { global.fetch = orig; }
+});
