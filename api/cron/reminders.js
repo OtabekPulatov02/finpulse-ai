@@ -144,15 +144,9 @@ async function processTaskReminders(todayStr) {
     const showOverdue = ns.overdue !== false && overdue.length;
     const showDueToday = ns.dueSoon !== false && dueToday.length;
     if (group && (showOverdue || showDueToday)) {
-      const line = (t) =>
-        `№${t.num} · ${escapeHtml(t.company)}\nСрок: ${t.dueDate}${t.assignee ? `\nИсполнитель: ${escapeHtml(t.assignee)}` : ""}`;
-      let text = `⏰ <b>Напоминания на ${todayStr}</b>`;
-      if (showOverdue) {
-        text += `\n\n🔴 <b>Просрочено (${overdue.length})</b>\n\n` + overdue.map(line).join("\n\n");
-      }
-      if (showDueToday) {
-        text += `\n\n🟡 <b>Срок сегодня (${dueToday.length})</b>\n\n` + dueToday.map(line).join("\n\n");
-      }
+      /* коротко: одна задача — две строки, с названием (раньше было «№164 · » без текста) */
+      const { remindersDigest } = require("../../lib/groupFormat.js");
+      const text = remindersDigest({ today: todayStr, overdue: showOverdue ? overdue : [], dueToday: showDueToday ? dueToday : [] });
       await tg("sendMessage", { chat_id: Number(group), text, parse_mode: "HTML" });
     }
   } catch (e) { /* карточка не критична */ }

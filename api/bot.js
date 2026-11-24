@@ -136,7 +136,7 @@ async function askAiInGroup(ctx, query, msg, priorHistory) {
       try { await redis.set("aiopt:" + token, { history: newHistory, options }, { ex: 24 * 3600 }); } catch (e) { /* noop */ }
       replyMarkup = { inline_keyboard: options.map((opt, i) => [{ text: String(opt).slice(0, 64), callback_data: `aio:${token}:${i}` }]) };
     }
-    const sent = await sendLong(ctx, `🤖 <b>ИИ-бухгалтер</b> (${escapeHtml(byName)}):\n${body}\n\n<i>↩️ Ответьте на это сообщение, чтобы продолжить</i>`, {
+    const sent = await sendLong(ctx, `🤖 <b>ИИ</b> · для ${escapeHtml(byName)}\n${body}\n<i>↩️ Реплай — продолжим</i>`, {
       parse_mode: "HTML", reply_to_message_id: msg.message_id, ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
     });
     /* Сохраняем историю диалога под id только что отправленного сообщения —
@@ -1355,27 +1355,20 @@ async function createTaskFromDraft(ctx, u, deferred) {
 
   /* Карточка в группу бухгалтеров (без личных данных клиента) */
   try {
-    const catLine = task.category ? `🗂 ${escapeHtml(task.category)}${task.sub ? " · " + escapeHtml(task.sub) : ""}\n` : "";
-    const base =
-      `🆕 <b>Задача №${num}</b> · ⚪️ Новая\n` +
-      `🏢 <b>${escapeHtml(task.company || "—")}</b>\n` +
-      catLine +
-      `━━━━━━━━━━━━\n`;
-    const tail =
-      (task.files.length ? `\n\n📎 Вложений: ${task.files.length}` : "") +
-      (deferred ? `\n⏸ <i>Получена вне часов приёма — в работу с ${set.workStart}:00</i>` : "") +
-      `\n\n↩️ <i>Ответьте на это сообщение — ответ уйдёт клиенту</i>` +
-      `\n👉 <i>Исполнитель и статус — в CRM</i>`;
-    const room = 3700 - base.length - tail.length;
+    /* короткая карточка: заголовок + «Поле: значение» (lib/groupFormat.js) */
+    const { taskCard } = require("../lib/groupFormat.js");
+    const cardOf = (bodyHtml) => taskCard({
+      num, status: "new", company: task.company, category: task.category, sub: task.sub,
+      files: task.files.length, bodyHtml, deferredFrom: deferred ? set.workStart : null,
+    });
+    const room = 3700 - cardOf("").length;
     let body = escapeHtml(task.text);
     let rest = "";
     if (body.length > room) {
       rest = body.slice(room);
-      body = "<b>" + body.slice(0, room) + "</b>… <i>(продолжение ⬇️)</i>";
-    } else {
-      body = "<b>" + body + "</b>";
+      body = body.slice(0, room) + "… <i>(продолжение ⬇️)</i>";
     }
-    const gm = await sendToGroup((gid) => bot.api.sendMessage(gid, base + body + tail, { parse_mode: "HTML" }));
+    const gm = await sendToGroup((gid) => bot.api.sendMessage(gid, cardOf(body), { parse_mode: "HTML" }));
     if (!gm) return; // группа не привязана — карточка некуда отправлять
     task.gmsg = gm.message_id;
     await redis.set(taskKey(num), task);
@@ -1391,7 +1384,7 @@ async function createTaskFromDraft(ctx, u, deferred) {
     }
 
     for (const f of task.files) {
-      const fm = await sendToGroup((gid) => sendFileTo(gid, f, `📎 к задаче №${num}`));
+      const fm = await sendToGroup((gid) => sendFileTo(gid, f, `📎 №${num}`));
       if (fm) await redis.set(groupRouteKey(fm.message_id), num);
     }
   } catch (e) {
@@ -1407,7 +1400,7 @@ async function createTaskFromDraft(ctx, u, deferred) {
         const { intakeTask, draftFromTask } = require("../lib/ai.js");
         const { buildClientContext, addMemory } = require("../lib/brain.js");
         const cats = await getCategories();
-        const clientContext = await buildClientContext(redis, task.company);
+        const clientContext = await buildClientContext(redis, task.company, { excludeNum: num });
 
         /* загрузка сотрудников для рекомендации исполнителя */
         let employees = [];
@@ -1492,22 +1485,15 @@ async function createTaskFromDraft(ctx, u, deferred) {
 
           /* подсказка бухгалтерам — ответом на карточку задачи */
           try {
-            const e2 = escapeHtml;
-            const lines = [
-              `🤖 <b>AI-бухгалтер</b> · задача №${num}`,
-              `🗂 ${e2(task.category || "категория не определена")}${task.sub ? " · " + e2(task.sub) : ""}`,
-              `⚡ <b>Приоритет:</b> ${ai.priority} · <b>сложность:</b> ${ai.complexity === "simple" ? "простая" : ai.complexity === "complex" ? "сложная" : "средняя"}`,
-            ];
-            if (task.dueDate) lines.push(`📅 <b>Срок:</b> ${task.dueDate}`);
-            if (task.assignee) lines.push(`👤 <b>Исполнитель:</b> ${e2(task.assignee)} (наименее загружен) — взята в работу`);
-            if (ai.operation1c) lines.push(`🧾 <b>Операция 1С:</b> ${e2(ai.operation1c)}`);
-            if (attText) lines.push(`📎 <b>Из вложений:</b>\n${e2(attText.slice(0, 900))}`);
-            if (!ai.relevant) lines.push("⚠️ <i>Похоже, заявка не относится к бухгалтерии — уточните у клиента.</i>");
-            if (ai.missing.length) lines.push(`❗ <b>Не хватает:</b> ${e2(ai.missing.join(", "))}`);
-            if (draft) lines.push("📝 <b>Черновик операции готов</b> — проверьте в CRM.");
-            if (ai.hint) lines.push(`\n💡 ${e2(ai.hint)}`);
+            const { aiIntakeNote } = require("../lib/groupFormat.js");
+            const noteHtml = aiIntakeNote({
+              num, priority: ai.priority, complexity: ai.complexity, dueDate: task.dueDate, assignee: task.assignee,
+              operation1c: ai.operation1c, attText, relevant: ai.relevant, missing: ai.missing, draft: !!draft, hint: ai.hint,
+            });
             const reply = task.gmsg ? { reply_to_message_id: task.gmsg } : {};
-            const hm = await sendToGroup((gid) => bot.api.sendMessage(gid, lines.join("\n"), { ...reply, parse_mode: "HTML" }));
+            const hm = await sendToGroup((gid) => bot.api.sendMessage(gid, noteHtml, { ...reply, parse_mode: "HTML" }));
+            /* запоминаем разбор — вопрос ИИ потом допишется в него же, а не новым сообщением */
+            if (hm) { task.aiNote = { msg: hm.message_id, html: noteHtml, at: Date.now() }; await redis.set(taskKey(num), task); }
             if (hm) await redis.set(groupRouteKey(hm.message_id), num);
           } catch (e) { /* noop */ }
         }

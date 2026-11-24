@@ -455,6 +455,19 @@ async function internal1cPost(body) {
 
 /* Прямая отправка в Telegram-группу бухгалтеров (не через bot.js — тот же
    токен и та же логика подхвата migrate_to_chat_id при апгрейде группы). */
+/* Любой метод Bot API в группу (editMessageText и т.п.) */
+async function tgGroupCall(method, payload) {
+  const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+  if (!TOKEN) return null;
+  const group = await redis.get("group");
+  if (!group) return null;
+  return fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ chat_id: Number(group), ...payload }),
+  }).then((r) => r.json()).catch(() => null);
+}
+
 async function tgGroupSend(payload) {
   const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
   if (!TOKEN) return null;
@@ -548,16 +561,34 @@ async function buildAiqKeyboard(num, kind, suggestions) {
 
 async function askClarificationInGroup(num, task, questionText, kind, suggestions) {
   const replyMarkup = await buildAiqKeyboard(num, kind, suggestions).catch(() => undefined);
-  const msg = await tgGroupSend({
-    text: `🤖 <b>Задача №${num}</b> — нужна ваша помощь
-
-${escapeHtmlLocal(questionText)}
-
-<i>Нажмите кнопку с нужным вариантом ниже, или ответьте реплаем на это сообщение своим текстом — я продолжу работу над задачей.</i>`,
-    parse_mode: "HTML",
-    ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-    ...(task.gmsg ? { reply_to_message_id: task.gmsg } : {}),
-  });
+  const { aiQuestionBlock, escapeHtml: esc } = require("../lib/groupFormat.js");
+  const qHtml = aiQuestionBlock(questionText, !!replyMarkup);
+  /* Был свежий разбор ИИ по этой задаче (≤30 мин) — дописываем вопрос в него
+     же (editMessageText), а не шлём третье сообщение подряд. Строку
+     «Исполнитель» обновляем: автономный режим мог взять задачу на себя. */
+  let msg = null;
+  const note = task.aiNote;
+  if (note && note.msg && note.html && Date.now() - (note.at || 0) < 30 * 60 * 1000) {
+    let html = note.html.replace(/\n❓ <b>Вопрос:<\/b>[\s\S]*$/, "");
+    if (task.assignee) {
+      html = /<b>Исполнитель:<\/b>/.test(html)
+        ? html.replace(/<b>Исполнитель:<\/b> [^\n]*/, `<b>Исполнитель:</b> ${esc(task.assignee)}`)
+        : html;
+    }
+    const edited = await tgGroupCall("editMessageText", {
+      message_id: note.msg, text: `${html}\n${qHtml}`, parse_mode: "HTML",
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+    });
+    if (edited && edited.ok) msg = { message_id: note.msg };
+  }
+  if (!msg) {
+    msg = await tgGroupSend({
+      text: `🤖 <b>№${num}</b> · нужен ответ\n${qHtml}`,
+      parse_mode: "HTML",
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      ...(task.gmsg ? { reply_to_message_id: task.gmsg } : {}),
+    });
+  }
   if (msg) {
     try {
       await redis.set("aiq:" + msg.message_id, { num, kind: kind || "generic", suggestions: suggestions || [] }, { ex: 3 * 24 * 3600 });
@@ -578,19 +609,12 @@ async function reportExecSuccess(num, task, draft, execRes) {
   try { await redis.del("aiq_task:" + num); } catch (e) { /* noop */ }
   const entityName = ENTITY_RU_NAMES[execRes.entity] || execRes.entity;
   const summary =
-    `✅ Задача №${num} — документ подготовлен в 1С
-
-` +
-    `📄 ${entityName}${execRes.number ? " №" + execRes.number : ""}
-` +
-    (draft.amount ? `💰 Сумма: ${Number(draft.amount).toLocaleString("ru-RU")} UZS
-` : "") +
-    (draft.counterparty ? `🤝 Контрагент: ${draft.counterparty}
-` : "") +
-    (execRes.note ? `⚠️ ${execRes.note}
-` : "") +
-    `
-👉 Осталось бухгалтеру: проверить документ в 1С и провести/отправить.`;
+    `✅ №${num} · документ в 1С готов\n` +
+    `Документ: ${entityName}${execRes.number ? " №" + execRes.number : ""}\n` +
+    (draft.amount ? `Сумма: ${Number(draft.amount).toLocaleString("ru-RU")} UZS\n` : "") +
+    (draft.counterparty ? `Контрагент: ${draft.counterparty}\n` : "") +
+    (execRes.note ? `⚠️ ${execRes.note}\n` : "") +
+    `Дальше: проверить и провести в 1С`;
   await tgGroupSend({
     text: escapeHtmlLocal(summary),
     ...(task.gmsg ? { reply_to_message_id: task.gmsg } : {}),
@@ -608,9 +632,7 @@ async function reportExecSuccess(num, task, draft, execRes) {
 
 async function reportExecBlocked(num, task, errorText) {
   try { await redis.del("aiq_task:" + num); } catch (e) { /* noop */ }
-  const blockedText = `⚠️ Задача №${num} — не смог выполнить автоматически: ${errorText || "неизвестная ошибка"}.
-
-👉 Нужна ручная обработка бухгалтером.`;
+  const blockedText = `⚠️ №${num} · не смог выполнить сам\nПричина: ${errorText || "неизвестная ошибка"}\nДальше: нужна ручная обработка`;
   await tgGroupSend({
     text: escapeHtmlLocal(blockedText),
     ...(task.gmsg ? { reply_to_message_id: task.gmsg } : {}),
@@ -1047,3 +1069,6 @@ module.exports = async (req, res) => {
     res.status(200).json({ ok: false, error: String(e).slice(0, 300) });
   }
 };
+
+/* для тестов */
+module.exports._askClarificationInGroup = askClarificationInGroup;

@@ -202,6 +202,7 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+const { taskCard } = require("../lib/groupFormat.js");
 const STATUS_TOP = { new: "⚪️ Новая", in_progress: "🔵 В работе", done: "🟢 Выполнена", cancelled: "🚫 Отменена" };
 const STATUS_LINE = {
   new: "⚪️ Статус: Новая",
@@ -628,13 +629,11 @@ async function createTaskFromCrm({ clientId, company, text, assignee, dueDate, t
      последовательного ожидания (клиентское уведомление ещё и требует
      отдельного чтения user:<id> для языка — это тоже не блокирует
      отправку карточки в группу). */
-  const header =
-    `🆕 <b>Задача №${num}</b> · ${STATUS_TOP[task.status] || task.status}\n` +
-    `🏢 <b>${escapeHtml(finalCompany || "—")}</b>\n━━━━━━━━━━━━\n` +
-    `<b>${escapeHtml(cleanText.slice(0, 3600))}</b>` +
-    (task.assignee ? `\n\n👩‍💼 <b>Исполнитель:</b> ${escapeHtml(task.assignee)}` : "") +
-    `\n✍️ <i>Заведена из CRM: ${escapeHtml(actor || "CRM")}</i>` +
-    (task.status === "new" ? `\n👉 <i>Исполнитель и статус — в CRM</i>` : "");
+  const header = taskCard({
+    num, status: task.status, company: finalCompany, category: task.category, sub: task.sub,
+    assignee: task.assignee, files: Array.isArray(task.files) ? task.files.length : 0,
+    bodyHtml: escapeHtml(cleanText.slice(0, 3600)), createdBy: actor || "CRM", replyHint: !!telegramId,
+  });
 
   const groupPromise = tgToGroup("sendMessage", { text: header, parse_mode: "HTML" }).catch(() => null);
   const clientPromise = telegramId
@@ -723,7 +722,7 @@ async function attachFileToTask(task, buf, filename, mimeType, actor, fromClient
   if (!group) return { ok: false, error: "Группа бухгалтеров не настроена — файл не отправлен" };
 
   const isImage = /^image\//.test(mimeType || "");
-  const caption = `📎 к задаче №${task.num} (из CRM, от ${actor || "CRM"})`.slice(0, 1024);
+  const caption = `📎 №${task.num} · из CRM (${actor || "CRM"})`.slice(0, 1024);
 
   let resp;
   try {
@@ -1157,14 +1156,11 @@ async function updateStatus(num, status, assignee) {
      ожидания. */
   const groupPromise = task.gmsg
     ? (() => {
-        const catLine = task.category ? `🗂 ${escapeHtml(task.category)}${task.sub ? " · " + escapeHtml(task.sub) : ""}\n` : "";
-        const header =
-          `🆕 <b>Задача №${num}</b> · ${STATUS_TOP[status] || status}\n` +
-          `🏢 <b>${escapeHtml(task.company || "—")}</b>\n` + catLine + `━━━━━━━━━━━━\n` +
-          `<b>${escapeHtml(String(task.text).slice(0, 3600))}</b>` +
-          (task.files && task.files.length ? `\n\n📎 Вложений: ${task.files.length}` : "") +
-          (task.assignee && status !== "new" ? `\n👩‍💼 <b>Исполнитель:</b> ${escapeHtml(task.assignee)}` : "") +
-          (status === "new" ? `\n👉 <i>Исполнитель и статус — в CRM</i>` : "");
+        const header = taskCard({
+          num, status, company: task.company, category: task.category, sub: task.sub, assignee: task.assignee,
+          files: Array.isArray(task.files) ? task.files.length : 0,
+          bodyHtml: escapeHtml(String(task.text).slice(0, 3600)), replyHint: !!task.client,
+        });
         return tgToGroup("editMessageText", { message_id: task.gmsg, text: header, parse_mode: "HTML" }).catch(() => null);
       })()
     : Promise.resolve(null);
