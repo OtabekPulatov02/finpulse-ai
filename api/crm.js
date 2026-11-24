@@ -79,11 +79,8 @@ if (API_KEY && API_KEY.length < 32) {
   console.warn("SECURITY: CRM_API_KEY короче 32 символов — увеличьте длину секрета.");
 }
 
-function resolveOrigin(req) {
-  const origin = req.headers.origin || "";
-  if (!ALLOWED_ORIGINS.length) return origin || "*"; // список ещё не настроен — не ломаем текущую работу
-  return ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-}
+/* превью-деплои фронта тоже пускаем — см. lib/cors.js */
+const { resolveOrigin } = require("../lib/cors.js");
 
 /* Сравнение за постоянное время — обычное === для сравнения секретов
    теоретически позволяет измерять тайминг посимвольного сравнения.

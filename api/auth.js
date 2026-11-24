@@ -38,11 +38,8 @@ if (process.env.BOOTSTRAP_ADMIN_SECRET && process.env.BOOTSTRAP_ADMIN_SECRET.len
   console.warn("SECURITY: BOOTSTRAP_ADMIN_SECRET короче 20 символов — увеличьте длину секрета.");
 }
 
-function resolveOrigin(req) {
-  const origin = req.headers.origin || "";
-  if (!ALLOWED_ORIGINS.length) return origin || "*";
-  return ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-}
+/* превью-деплои фронта тоже пускаем — см. lib/cors.js */
+const { resolveOrigin } = require("../lib/cors.js");
 
 /* Сравнение секретов за постоянное время — обычное ===/!== для
    bearer-подобных значений (API-ключ, bootstrap-секрет) теоретически
