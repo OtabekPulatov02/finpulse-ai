@@ -2116,8 +2116,14 @@ async function setupBotProfile() {
 }
 
 /* ---------------- Vercel handler ---------------- */
+/* grammY по умолчанию ждёт апдейт 10 с и бросает ошибку («Request timed out
+   after 10000 ms» в логах), хотя разбор ИИ + вложения идут дольше; ответ
+   Telegram уходил раньше, чем работа заканчивалась. Ждём до 55 с
+   (maxDuration 60 с) и при таймауте молча отвечаем 200, без ошибки. */
 const handleUpdate = webhookCallback(bot, "http", {
   secretToken: process.env.TG_WEBHOOK_SECRET || undefined,
+  timeoutMilliseconds: 55000,
+  onTimeout: "return",
 });
 
 module.exports = async (req, res) => {
