@@ -18,6 +18,15 @@
 
    Защита эндпоинта: как и у /api/cron/reminders — если задан
    CRON_SECRET, требуется "Authorization: Bearer <CRON_SECRET>".
+
+   Лимит 60 с (24.11.2026): полный прогон — 8 справочников × N баз
+   последовательно — не влезал в maxDuration и падал с Runtime Timeout.
+   Теперь прогон идёт по очереди шагов (база × справочник) с бюджетом
+   времени: что не успели — сохраняется в Redis (1c:sync:cursor) и
+   продолжается следующим вызовом (?mode=continue — функция сама себя
+   дёргает; страховка — почасовой GitHub Actions, который сначала
+   доделывает незаконченный полный прогон). Одновременный запуск двух
+   прогонов исключён замком 1c:sync:lock.
    ============================================================ */
 
 const jwt = require("jsonwebtoken");
@@ -60,14 +69,54 @@ function internalToken() {
   return jwt.sign({ role: "admin", name: "Cron 1C-sync" }, JWT_SECRET, { algorithm: "HS256", expiresIn: "2m" });
 }
 
-async function callApi1c(token, body) {
+async function callApi1c(token, body, timeoutMs = 45000) {
   const r = await fetch(`${SELF}/api/1c`, {
     method: "POST",
     headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(45000),
+    signal: AbortSignal.timeout(Math.max(3000, timeoutMs)),
   });
   return r.json().catch(() => ({ ok: false, error: "bad json" }));
+}
+
+const BUDGET_MS = 50000;          /* запас до maxDuration 60 с */
+const MIN_STEP_MS = 8000;         /* меньше — новый шаг не начинаем */
+const CURSOR_KEY = "1c:sync:cursor";
+const LOCK_KEY = "1c:sync:lock";
+const FULL_STEPS = ["orgs", "counterparties", "contracts", "nomenclature", "reports", "employees", "positions", "departments"];
+const LIGHT_STEPS = ["orgs", "counterparties"];
+
+/* Очередь шагов: сначала все справочники первой базы, потом второй и т.д. */
+function buildQueue(apps, light) {
+  const steps = light ? LIGHT_STEPS : FULL_STEPS;
+  const q = [];
+  for (const a of apps) for (const step of steps) q.push({ code: a.code, name: a.name, step });
+  return q;
+}
+
+/* Базы, где не прошёл ни один справочник, — для алерта в группу */
+function brokenBases(stats) {
+  return Object.values(stats || {})
+    .filter((b) => b.fail > 0 && b.ok === 0)
+    .map((b) => `${b.name}: ${b.lastErr || "неизвестная ошибка"}`);
+}
+
+/* Решение, что делать в этом вызове: начать новый прогон или продолжить старый.
+   full (ночной) — всегда начинает заново; light (почасовой) — сначала доделывает
+   незаконченный прогон; continue — только продолжает. */
+function planRun(mode, cursor) {
+  const unfinished = cursor && Array.isArray(cursor.queue) && cursor.queue.length > 0;
+  if (mode === "full") return "new-full";
+  if (mode === "continue") return unfinished ? "resume" : "nothing";
+  return unfinished ? "resume" : "new-light";
+}
+
+async function selfContinue() {
+  /* Не ждём ответа: вызов продолжает работу на Vercel и после обрыва соединения */
+  await fetch(`${SELF}/api/cron/1c-sync?mode=continue`, {
+    headers: CRON_SECRET ? { authorization: `Bearer ${CRON_SECRET}` } : {},
+    signal: AbortSignal.timeout(2500),
+  }).catch(() => null);
 }
 
 module.exports = async (req, res) => {
@@ -78,70 +127,77 @@ module.exports = async (req, res) => {
     }
   }
 
+  const started = Date.now();
+  const left = () => BUDGET_MS - (Date.now() - started);
+  const q = (req.query && req.query.mode) || "full";
+  const mode = q === "light" || q === "continue" ? q : "full";
+
+  const got = await redis.set(LOCK_KEY, String(started), { nx: true, ex: 58 }).catch(() => "OK");
+  if (!got) return res.status(200).json({ ok: true, skipped: "another run in progress" });
+
   try {
     const token = internalToken();
-    const pingRes = await fetch(`${SELF}/api/1c?r=ping`, {
-      headers: token ? { authorization: `Bearer ${token}` } : {},
-      signal: AbortSignal.timeout(30000),
-    }).then((r) => r.json()).catch(() => null);
+    let cursor = await redis.get(CURSOR_KEY).catch(() => null);
+    if (typeof cursor === "string") { try { cursor = JSON.parse(cursor); } catch { cursor = null; } }
+    const plan = planRun(mode, cursor);
+    if (plan === "nothing") return res.status(200).json({ ok: true, mode, nothing: true });
 
-    const apps = (pingRes && pingRes.apps) || [];
-    const ready = apps.filter((a) => a.ready);
-    const results = [];
-
-    /* ?mode=light — облегчённый прогон для почасового триггера (GitHub
-       Actions, см. .github/workflows/hourly-1c-sync.yml — Vercel Hobby
-       cron не умеет чаще раза в сутки). Синкает только организации и
-       контрагентов — самое "летучее" и нужное для актуальности CRM в
-       течение дня. Полный прогон (номенклатура/договоры/кадры) остаётся
-       только ночным: у баз Clobus жёсткий лимит одновременных сеансов
-       (сами в этом убедились на PRESTIGE CLUB), гонять все 8 типов по
-       всем базам каждый час — верный способ упереться в этот лимit. */
-    const light = req.query && req.query.mode === "light";
-
-    for (const a of ready) {
-      const row = { code: a.code, name: a.name };
-      row.orgs = await callApi1c(token, { action: "sync_orgs", app: a.code });
-      row.counterparties = await callApi1c(token, { action: "sync_counterparties", app: a.code });
-      if (!light) {
-        row.contracts = await callApi1c(token, { action: "sync_contracts", app: a.code });
-        row.nomenclature = await callApi1c(token, { action: "sync_nomenclature", app: a.code });
-        row.reports = await callApi1c(token, { action: "sync_reports", app: a.code });
-        row.employees = await callApi1c(token, { action: "sync_employees", app: a.code });
-        row.positions = await callApi1c(token, { action: "sync_positions", app: a.code });
-        row.departments = await callApi1c(token, { action: "sync_departments", app: a.code });
-      }
-      results.push(row);
-             /* пауза между базами — вместе со staggered pingAll() в api/1c.js
-                      снижает давление на общий лимит запросов Clobus на абонента */
-             if (ready.indexOf(a) < ready.length - 1) await sleep(500);
+    if (plan !== "resume") {
+      /* /api/1c?r=ping сам ходит по всем базам — тоже под бюджет */
+      const pingRes = await fetch(`${SELF}/api/1c?r=ping`, {
+        headers: token ? { authorization: `Bearer ${token}` } : {},
+        signal: AbortSignal.timeout(25000),
+      }).then((r) => r.json()).catch(() => null);
+      const apps = (pingRes && pingRes.apps) || [];
+      const ready = apps.filter((a) => a.ready);
+      cursor = { kind: plan === "new-light" ? "light" : "full", startedAt: new Date(started).toISOString(), total: apps.length, ready: ready.length, queue: buildQueue(ready, plan === "new-light"), stats: {}, calls: 0 };
     }
 
-    /* Мониторинг: раньше сбой синка был виден только если кто-то открывал
-       Vercel-логи или замечал устаревшие данные в 1С-разделе. Теперь если
-       хотя бы одна база не смогла синкнуть ни один тип сущностей — шлём
+    let prev = null;
+    while (cursor.queue.length && left() > MIN_STEP_MS) {
+      const it = cursor.queue[0];
+      if (prev && prev !== it.code) await sleep(400); /* пауза между базами — лимит Clobus на абонента */
+      const r = await callApi1c(token, { action: `sync_${it.step}`, app: it.code }, Math.min(40000, left() - 3000))
+        .catch((e) => ({ ok: false, error: String(e && e.name === "TimeoutError" ? "таймаут" : e).slice(0, 120) }));
+      const st = cursor.stats[it.code] || (cursor.stats[it.code] = { name: it.name, ok: 0, fail: 0, lastErr: null });
+      if (r && r.ok !== false) st.ok++; else { st.fail++; st.lastErr = (r && r.error) || "ошибка"; }
+      cursor.queue.shift();
+      cursor.calls++;
+      prev = it.code;
+    }
+
+    const remaining = cursor.queue.length;
+    if (remaining) {
+      await redis.set(CURSOR_KEY, JSON.stringify(cursor), { ex: 6 * 3600 });
+      await redis.del(LOCK_KEY).catch(() => null);
+      await selfContinue();
+      return res.status(200).json({ ok: true, mode, kind: cursor.kind, remaining, done: cursor.calls, ms: Date.now() - started });
+    }
+
+    await redis.del(CURSOR_KEY).catch(() => null);
+    /* Мониторинг: если хотя бы одна база не смогла синкнуть ни один справочник —
        алерт в группу бухгалтеров с перечнем проблемных баз. */
-    const KEYS = light
-      ? ["orgs", "counterparties"]
-      : ["orgs", "counterparties", "contracts", "nomenclature", "reports", "employees", "positions", "departments"];
-    const brokenBases = results
-      .filter((row) => KEYS.every((k) => row[k] && row[k].ok === false))
-      .map((row) => `${row.name}: ${row.orgs && row.orgs.error ? row.orgs.error : "неизвестная ошибка"}`);
-    if (brokenBases.length) {
-      const label = light ? "Часовой синк 1С" : "Ночной синк 1С";
+    const broken = brokenBases(cursor.stats);
+    if (broken.length) {
+      const label = cursor.kind === "light" ? "Часовой синк 1С" : "Ночной синк 1С";
       await tgToGroup({
-        text: `⚠️ <b>${label} не смог обновить ни один справочник</b> в ${brokenBases.length} из ${ready.length} баз:\n${brokenBases.map((b) => "• " + b).join("\n")}\n\nПроверьте логи Vercel (cron/1c-sync) и доступ к базе в Clobus.`,
+        text: `⚠️ <b>${label} не смог обновить ни один справочник</b> в ${broken.length} из ${cursor.ready} баз:\n${broken.map((b) => "• " + b).join("\n")}\n\nПроверьте логи Vercel (cron/1c-sync) и доступ к базе в Clobus.`,
         parse_mode: "HTML",
       }).catch(() => null);
     }
-
-    return res.status(200).json({ ok: true, mode: light ? "light" : "full", total: apps.length, synced: ready.length, results });
+    return res.status(200).json({ ok: true, mode, kind: cursor.kind, total: cursor.total, synced: cursor.ready, calls: cursor.calls, stats: cursor.stats, ms: Date.now() - started });
   } catch (e) {
     console.error("1c-sync cron:", e);
     await tgToGroup({
-      text: `🔴 <b>Ночной синк 1С упал целиком</b>\n${String(e).slice(0, 300)}\n\nПроверьте логи Vercel (cron/1c-sync).`,
+      text: `🔴 <b>Синк 1С упал целиком</b>\n${String(e).slice(0, 300)}\n\nПроверьте логи Vercel (cron/1c-sync).`,
       parse_mode: "HTML",
     }).catch(() => null);
     return res.status(200).json({ ok: false, error: String(e).slice(0, 300) });
+  } finally {
+    await redis.del(LOCK_KEY).catch(() => null);
   }
 };
+
+module.exports.buildQueue = buildQueue;
+module.exports.brokenBases = brokenBases;
+module.exports.planRun = planRun;

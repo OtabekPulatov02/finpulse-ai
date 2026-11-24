@@ -222,6 +222,14 @@ async function logEvent(source, event, data) {
       .catch(() => {}); /* noop */ }
 }
 
+/* Дата в ISO (аналитика по периодам на фронте сравнивает Date.parse):
+   старые записи могли хранить число (мс) или иную строку — приводим. */
+function isoOrNull(v) {
+  if (v == null || v === "") return null;
+  const d = new Date(typeof v === "number" || /^\d{10,13}$/.test(String(v)) ? Number(String(v).length === 10 ? Number(v) * 1000 : v) : v);
+  return isNaN(d.getTime()) ? null : d.toISOString();
+}
+
 function safeTask(t) {
   if (!t) return null;
   return {
@@ -233,7 +241,7 @@ function safeTask(t) {
     sub: t.sub || null,
     deferred: !!t.deferred,
     assignee: t.assignee || null,
-    createdAt: t.createdAt || null,
+    createdAt: isoOrNull(t.createdAt),
     files: Array.isArray(t.files) ? t.files.length : 0,
     /* Метаданные вложений (без file_id — он остаётся на сервере, чтобы не
        светить его в браузере; сами байты отдаются через r=task_file). */
@@ -243,7 +251,7 @@ function safeTask(t) {
     aiIntake: t.aiIntake || null,
     aiDraft: t.aiDraft || null,
     source: t.source === "crm" ? "crm" : "bot",
-    doneAt: t.doneAt || null,
+    doneAt: isoOrNull(t.doneAt),
     /* "task" — обычная задача, "reminder" — авто-созданная из календаря
        (налог/платёж); у напоминаний нет company. */
     type: t.type === "reminder" ? "reminder" : "task",
