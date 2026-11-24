@@ -894,9 +894,14 @@ module.exports = async (req, res) => {
         /* Вложения из Telegram (фото/PDF, на которые ответили «Бот, …») —
            читаем заранее и добавляем к последнему сообщению текстом. */
         let messages = body.messages;
-        if (Array.isArray(body.attachments) && body.attachments.length) {
+        /* attachments — файлы Telegram (file_id); files — файлы из AI-чата CRM ({name, mime, data: base64}) */
+        const atts = [
+          ...(Array.isArray(body.attachments) ? body.attachments : []),
+          ...(Array.isArray(body.files) ? body.files.filter((f) => f && typeof f.data === "string").slice(0, 4) : []),
+        ];
+        if (atts.length) {
           try {
-            const ex = await extractAttachments(body.attachments, { question: String((messages[messages.length - 1] || {}).content || ""), redis, logUsage });
+            const ex = await extractAttachments(atts, { question: String((messages[messages.length - 1] || {}).content || ""), redis, logUsage });
             const note = ex.ok
               ? "\n\n[Данные из приложенных файлов]\n" + docsToText(ex.docs) + "\n[JSON]" + JSON.stringify(ex.docs).slice(0, 6000)
               : "\n\n[Файлы приложены, но прочитать не удалось: " + ((ex.skipped || []).map((x) => x.name + " — " + x.reason).join("; ") || ex.error || "ошибка") + "]";
