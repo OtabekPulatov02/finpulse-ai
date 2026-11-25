@@ -102,12 +102,15 @@ const AGENT_TOOLS = [
   { type: "function", function: { name: "draft_contract", description: "Интеллектуальный выбор шаблона документа (договор/доверенность-текст/доп.соглашение) + автозаполнение реквизитов + рендер черновика. Можно вызвать БЕЗ num и БЕЗ templateId — просто чтобы получить список доступных шаблонов (например, если пользователь ещё не назвал задачу). Если известен num — дополнительно вернётся smart-подсказка по истории конкретного клиента. Для автозаполнения реквизитов, проверки заполненности и сохранения черновика в ленту задачи num обязателен. Вызови с templateId и fields (без confirm), чтобы получить filled/missing. Затем с confirm:true и полным набором fields, чтобы сохранить готовый черновик в ленту задачи.", parameters: { type: "object", properties: { num: { type: "number", description: "номер задачи CRM (не обязателен только для простого списка шаблонов без templateId)" }, templateId: { type: "string" }, fields: { type: "object", description: "известные значения плейсхолдеров шаблона, напр. {subject, amount, term}" }, confirm: { type: "boolean" } } } } },
 ];
 
-async function callTool(name, args, authHeaders) {
+async function callTool(name, args, authHeaders, ctl = {}) {
+  /* не дольше остатка бюджета агента; общий стоп — ctl.signal */
+  const ms = Math.max(3000, Math.min(25000, ctl.leftMs || 25000));
+  const sig = () => (ctl.signal ? AbortSignal.any([AbortSignal.timeout(ms), ctl.signal]) : AbortSignal.timeout(ms));
   const base = name.startsWith("crm") ? SELF + "/api/crm" : SELF + "/api/1c";
   try {
     let r;
     if (name.endsWith("_get")) {
-      r = await fetch(base + "?" + String(args.query || ""), { headers: authHeaders, signal: AbortSignal.timeout(20000) });
+      r = await fetch(base + "?" + String(args.query || ""), { headers: authHeaders, signal: sig() });
     } else {
       /* модель иногда присылает поля действия на верхнем уровне (без обёртки body) —
          подстрахуемся и в этом случае используем сами args как тело запроса. */
@@ -116,7 +119,7 @@ async function callTool(name, args, authHeaders) {
         method: "POST",
         headers: { "content-type": "application/json", ...authHeaders },
         body: JSON.stringify(payload || {}),
-        signal: AbortSignal.timeout(25000),
+        signal: sig(),
       });
     }
     const text = await r.text();
@@ -180,13 +183,15 @@ async function runAgent(messages, authHeaders, opts = {}) {
   const started = Date.now();
   const MODEL = pickModel(messages, opts);
   const convo = [{ role: "system", content: AGENT_SYSTEM }, ...messages.slice(-40)];
-  const steps = [];
+  const steps = opts.steps || [];
   for (let i = 0; i < AGENT_MAX_STEPS; i++) {
-    const left = AGENT_TIME_BUDGET_MS - (Date.now() - started);
+    if (opts.stop && opts.stop.stopped) return { reply: "", steps, model: MODEL, stopped: true };
+    /* бюджет считаем и от общего дедлайна запроса: чтение вложений до агента тоже тратит время */
+    const left = Math.min(AGENT_TIME_BUDGET_MS - (Date.now() - started), opts.deadline ? opts.deadline - Date.now() - 2000 : Infinity);
     if (left < 6000) {
       return { reply: "⏱ Задача большая — не успел закончить за отведённое время. Напишите «продолжи», и я доделаю.", steps, model: MODEL };
     }
-    const out = await openaiChat({ model: MODEL, messages: convo, tools: AGENT_TOOLS, maxTokens: 4000, temperature: 0.1, timeoutMs: Math.min(40000, left - 2000), reasoning: MODEL === modelStrong() ? "medium" : undefined });
+    const out = await openaiChat({ model: MODEL, messages: convo, tools: AGENT_TOOLS, maxTokens: 4000, temperature: 0.1, timeoutMs: Math.min(40000, left - 2000), reasoning: MODEL === modelStrong() ? "medium" : undefined, signal: opts.signal });
     void logUsage(redis, out.usage, out.model);
     void checkBudget();
     const data = { choices: [{ message: out.message }] };
@@ -325,7 +330,7 @@ async function runAgent(messages, authHeaders, opts = {}) {
           }
         } catch (e) { result = JSON.stringify({ ok: false, error: String(e).slice(0, 200) }); }
       } else {
-        result = await callTool(tc.function.name, args, authHeaders);
+        result = await callTool(tc.function.name, args, authHeaders, { signal: opts.signal, leftMs: (opts.deadline ? opts.deadline - Date.now() : AGENT_TIME_BUDGET_MS - (Date.now() - started)) - 2000 });
       }
       steps.push({ tool: tc.function.name, args: JSON.stringify(args).slice(0, 200), ok: !result.includes('"ok":false') });
       convo.push({ role: "tool", tool_call_id: tc.id, content: result });
@@ -354,16 +359,17 @@ async function saveChatMeta(meta) {
    и первому ответу — как в обычных чат-интерфейсах, вместо простого обрезания
    сырого текста сообщения. Если вызов не удался (нет ключа, таймаут и т.п.) —
    тихо откатываемся на старое поведение (обрезанный текст первого сообщения). */
-async function generateChatTitle(userText, replyText) {
-  const fallback = String(userText || "Диалог").slice(0, 60);
-  if (!process.env.OPENAI_API_KEY) return fallback;
+async function generateChatTitle(userText, replyText, timeoutMs = 8000) {
+  const fallback = String(userText || "Диалог").replace(/\s+/g, " ").trim().slice(0, 60);
+  /* мало времени до лимита функции — без ИИ, иначе 504 и «нет связи» у пользователя */
+  if (!process.env.OPENAI_API_KEY || timeoutMs < 3000) return fallback;
   try {
     const res = await chat([
       { role: "system", content: 'Придумай короткое название диалога (3-6 слов, на русском, без кавычек и точки в конце) по сути вопроса пользователя и ответа. Ответ строго JSON: {"title": "..."}.' },
       { role: "user", content: `Вопрос: ${String(userText || "").slice(0, 500)}
 
 Ответ: ${String(replyText || "").slice(0, 500)}` },
-    ], { maxTokens: 30, timeoutMs: 8000 });
+    ], { maxTokens: 30, timeoutMs: Math.min(8000, timeoutMs), strictTimeout: true });
     const title = String(res?.title || "").trim().slice(0, 60);
     return title || fallback;
   } catch (e) {
@@ -371,7 +377,7 @@ async function generateChatTitle(userText, replyText) {
   }
 }
 
-async function persistChat(chatId, messages, reply, steps) {
+async function persistChat(chatId, messages, reply, steps, deadline) {
   const id = chatId || "ch" + Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
   const stored = [...messages, { role: "assistant", content: reply, steps: steps || [] }].slice(-60);
   await redis.set("aichat:msgs:" + id, stored);
@@ -383,7 +389,7 @@ async function persistChat(chatId, messages, reply, steps) {
   const existing = isNewChat ? null : (await listChats()).find((c) => c.id === id);
   const title = existing
     ? existing.title
-    : await generateChatTitle(firstUser?.content, reply);
+    : await generateChatTitle(firstUser?.content, reply, deadline ? deadline + 4000 - Date.now() : 8000);
   await saveChatMeta({
     id,
     title,
@@ -917,25 +923,52 @@ module.exports = async (req, res) => {
            читаем заранее и добавляем к последнему сообщению текстом. */
         let messages = body.messages;
         /* attachments — файлы Telegram (file_id); files — файлы из AI-чата CRM ({name, mime, data: base64}) */
+        /* Vercel обрывает функцию на 60 с ответом 504 без CORS-заголовков —
+           браузер видит это как «нет связи». Отвечаем сами не позже 55 с. */
+        const deadline = Date.now() + Number(process.env.AGENT_DEADLINE_MS || 50000); // бот в группе ждёт ответа 55 с; функция живёт 60 с
         const atts = [
           ...(Array.isArray(body.attachments) ? body.attachments : []),
           ...(Array.isArray(body.files) ? body.files.filter((f) => f && typeof f.data === "string").slice(0, 4) : []),
         ];
         if (atts.length) {
           try {
-            const ex = await extractAttachments(atts, { question: String((messages[messages.length - 1] || {}).content || ""), redis, logUsage });
+            /* чтение файлов — не дольше 22 с, потом обрываем вызов (не оставляем фоном) */
+            const exCtl = new AbortController();
+            const exTimer = setTimeout(() => exCtl.abort(), 22000);
+            const ex = await extractAttachments(atts, { question: String((messages[messages.length - 1] || {}).content || ""), redis, logUsage, signal: exCtl.signal, timeoutMs: 21000 })
+              .catch(() => ({ ok: false, error: "файлы читались слишком долго" }));
+            clearTimeout(exTimer);
             const note = ex.ok
               ? "\n\n[Данные из приложенных файлов]\n" + docsToText(ex.docs) + "\n[JSON]" + JSON.stringify(ex.docs).slice(0, 6000)
               : "\n\n[Файлы приложены, но прочитать не удалось: " + ((ex.skipped || []).map((x) => x.name + " — " + x.reason).join("; ") || ex.error || "ошибка") + "]";
             messages = messages.slice(0, -1).concat([{ ...messages[messages.length - 1], content: String((messages[messages.length - 1] || {}).content || "") + note }]);
           } catch (e) { /* без вложений */ }
         }
-        const out = await runAgent(messages, {
-          ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}),
-          ...(req.headers["x-api-key"] ? { "x-api-key": req.headers["x-api-key"] } : {}),
-        }, { forceStrong: !!body.strong });
+        const steps = [];
+        const stop = { stopped: false };
+        const ctl = new AbortController();
+        let timer;
+        let out = await Promise.race([
+          runAgent(messages, {
+            ...(req.headers.authorization ? { authorization: req.headers.authorization } : {}),
+            ...(req.headers["x-api-key"] ? { "x-api-key": req.headers["x-api-key"] } : {}),
+          }, { forceStrong: !!body.strong, deadline, steps, stop, signal: ctl.signal }).catch((e) => ({ error: e })),
+          new Promise((resolve) => { timer = setTimeout(() => resolve({ timedOut: true }), Math.max(3000, deadline - Date.now())); }),
+        ]);
+        clearTimeout(timer);
+        if (out.timedOut) {
+          stop.stopped = true;
+          /* обрываем фоновые вызовы OpenAI/1С: иначе Vercel держит функцию до 60 с,
+             отвечает 504 без CORS, и в браузере это «Нет связи с сервером» */
+          ctl.abort();
+          out = { reply: "⏱ Не успел уложиться в минуту" + (steps.length ? ` (сделал шагов: ${steps.length})` : "") + ". Напишите «продолжи» — доделаю, или разбейте запрос на части.", steps, timedOut: true };
+          await logEvent("ai_agent_timeout", { steps: steps.length, by: actor });
+        } else if (out.error) {
+          console.error("ai agent:", String(out.error).slice(0, 300));
+          return res.status(200).json({ ok: false, error: "ИИ сейчас не ответил: " + String(out.error.message || out.error).slice(0, 160) });
+        }
         let chatId = body.chatId || null;
-        try { chatId = await persistChat(body.chatId, body.messages, out.reply, out.steps); } catch (e) { /* noop */ }
+        try { chatId = await persistChat(body.chatId, body.messages, out.reply, out.steps, deadline); } catch (e) { /* noop */ }
         await logEvent("ai_agent_run", { steps: out.steps.length, by: actor });
         return res.status(200).json({ ok: true, chatId, ...out });
       }
