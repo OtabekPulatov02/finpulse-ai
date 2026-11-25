@@ -176,8 +176,11 @@ async function checkBudget() {
   } catch (e) { /* noop */ }
 }
 
-const AGENT_MAX_STEPS = 14;
-const AGENT_TIME_BUDGET_MS = 47000; /* maxDuration 60с, бот в группе ждёт 55с */
+/* maxDuration api/ai.js — 300 с (vercel.json). Агенту в CRM-чате — до ~4,6 мин,
+   с запасом на ответ и сохранение диалога. Бот в группе ждёт ответ меньше
+   (вебхук Telegram) и сам присылает timeLimitMs. */
+const AGENT_MAX_STEPS = 30;
+const AGENT_TIME_BUDGET_MS = 280000;
 
 async function runAgent(messages, authHeaders, opts = {}) {
   const started = Date.now();
@@ -191,7 +194,7 @@ async function runAgent(messages, authHeaders, opts = {}) {
     if (left < 6000) {
       return { reply: "⏱ Задача большая — не успел закончить за отведённое время. Напишите «продолжи», и я доделаю.", steps, model: MODEL };
     }
-    const out = await openaiChat({ model: MODEL, messages: convo, tools: AGENT_TOOLS, maxTokens: 4000, temperature: 0.1, timeoutMs: Math.min(40000, left - 2000), reasoning: MODEL === modelStrong() ? "medium" : undefined, signal: opts.signal });
+    const out = await openaiChat({ model: MODEL, messages: convo, tools: AGENT_TOOLS, maxTokens: 4000, temperature: 0.1, timeoutMs: Math.min(90000, left - 2000), reasoning: MODEL === modelStrong() ? "medium" : undefined, signal: opts.signal });
     void logUsage(redis, out.usage, out.model);
     void checkBudget();
     const data = { choices: [{ message: out.message }] };
@@ -925,7 +928,8 @@ module.exports = async (req, res) => {
         /* attachments — файлы Telegram (file_id); files — файлы из AI-чата CRM ({name, mime, data: base64}) */
         /* Vercel обрывает функцию на 60 с ответом 504 без CORS-заголовков —
            браузер видит это как «нет связи». Отвечаем сами не позже 55 с. */
-        const deadline = Date.now() + Number(process.env.AGENT_DEADLINE_MS || 50000); // бот в группе ждёт ответа 55 с; функция живёт 60 с
+        const limit = Math.min(Number(process.env.AGENT_DEADLINE_MS || 275000), Number(body.timeLimitMs) > 5000 ? Number(body.timeLimitMs) : Infinity);
+        const deadline = Date.now() + limit; // функция живёт 300 с
         const atts = [
           ...(Array.isArray(body.attachments) ? body.attachments : []),
           ...(Array.isArray(body.files) ? body.files.filter((f) => f && typeof f.data === "string").slice(0, 4) : []),
@@ -961,7 +965,7 @@ module.exports = async (req, res) => {
           /* обрываем фоновые вызовы OpenAI/1С: иначе Vercel держит функцию до 60 с,
              отвечает 504 без CORS, и в браузере это «Нет связи с сервером» */
           ctl.abort();
-          out = { reply: "⏱ Не успел уложиться в минуту" + (steps.length ? ` (сделал шагов: ${steps.length})` : "") + ". Напишите «продолжи» — доделаю, или разбейте запрос на части.", steps, timedOut: true };
+          out = { reply: `⏱ Не успел уложиться в ${limit >= 120000 ? Math.round(limit / 60000) + " мин." : "минуту"}` + (steps.length ? ` (сделал шагов: ${steps.length})` : "") + ". Напишите «продолжи» — доделаю, или разбейте запрос на части.", steps, timedOut: true };
           await logEvent("ai_agent_timeout", { steps: steps.length, by: actor });
         } else if (out.error) {
           console.error("ai agent:", String(out.error).slice(0, 300));

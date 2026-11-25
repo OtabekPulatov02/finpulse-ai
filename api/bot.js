@@ -113,7 +113,7 @@ async function askAiInGroup(ctx, query, msg, priorHistory) {
     const r = await fetch(`${AUTOWORK_API_ORIGIN}/api/ai`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-      body: JSON.stringify({ action: "agent", messages, ...(attachments.length ? { attachments } : {}) }),
+      body: JSON.stringify({ action: "agent", messages, timeLimitMs: 50000, ...(attachments.length ? { attachments } : {}) }),
       signal: AbortSignal.timeout(55000),
     }).then((x) => x.json()).catch((e) => ({ ok: false, error: String(e).slice(0, 200) }));
     clearInterval(typingTimer);
